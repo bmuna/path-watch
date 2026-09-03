@@ -54,6 +54,24 @@ class GeoCache:
         with self._lock:
             return dict(self._cache)
 
+    def resolve_many(self, ips: list[str], limit: int = 100) -> None:
+        """Blocking lookup for analysis — skips IPs already cached or private."""
+        need = []
+        seen = set()
+        for ip in ips:
+            if not ip or ip in seen or is_private(ip):
+                continue
+            seen.add(ip)
+            if self.get(ip) is None:
+                need.append(ip)
+            if len(need) >= limit:
+                break
+        if need:
+            try:
+                self._fetch(need)
+            except Exception:
+                pass
+
     def stop(self):
         self._stop.set()
 

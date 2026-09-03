@@ -1,5 +1,6 @@
-import { useState, useEffect, useRef, useCallback } from 'react'
-import { MapContainer, TileLayer, CircleMarker, Popup, useMap } from 'react-leaflet'
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
+import { MapContainer, TileLayer, CircleMarker, Circle, Popup, useMap } from 'react-leaflet'
+import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
 import {
   AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer,
@@ -14,14 +15,26 @@ function useLive() {
   const [d, setD] = useState(null)
   const ws = useRef(null)
   useEffect(() => {
+    let alive = true
+    let timer = null
     function open() {
-      ws.current = new WebSocket(WS)
-      ws.current.onmessage = e => setD(JSON.parse(e.data))
-      ws.current.onclose   = () => setTimeout(open, 2000)
-      ws.current.onerror   = () => ws.current?.close()
+      if (!alive) return
+      const sock = new WebSocket(WS)
+      ws.current = sock
+      sock.onmessage = e => { if (alive) setD(JSON.parse(e.data)) }
+      sock.onclose = () => {
+        if (!alive) return
+        timer = setTimeout(open, 2000)
+      }
+      sock.onerror = () => { try { sock.close() } catch { /* ignore */ } }
     }
     open()
-    return () => ws.current?.close()
+    return () => {
+      alive = false
+      clearTimeout(timer)
+      try { ws.current?.close() } catch { /* ignore */ }
+      ws.current = null
+    }
   }, [])
   return d
 }
@@ -144,96 +157,320 @@ function AppList({ apps }) {
   )
 }
 
-// Vantage: Addis Ababa
-const VANTAGE = [9.0245, 38.7485]
+const DEFAULT_VANTAGE = [9.0245, 38.7485]
+const ADDIS_BOUNDS = [[8.88, 38.66], [9.12, 38.92]]
 
-// ── HeatLayer: draws the speed heatmap overlay ─────────────────────────────
+function numLatLon(lat, lon) {
+  const a = Number(lat), b = Number(lon)
+  return Number.isFinite(a) && Number.isFinite(b) ? [a, b] : null
+}
+
+/** Traffic-app palette: green → yellow → orange → purple */
+const HEAT_STOPS = [
+  [0.00, [46, 180, 90]],
+  [0.35, [232, 197, 71]],
+  [0.55, [240, 112, 48]],
+  [0.75, [220, 50, 80]],
+  [1.00, [124, 58, 237]], // purple throttle core
+]
+
+function heatColorAt(t) {
+  const x = Math.min(1, Math.max(0, t))
+  for (let i = 1; i < HEAT_STOPS.length; i++) {
+    const [a, ca] = HEAT_STOPS[i - 1]
+    const [b, cb] = HEAT_STOPS[i]
+    if (x <= b) {
+      const u = (x - a) / (b - a || 1)
+      return [
+        Math.round(ca[0] + (cb[0] - ca[0]) * u),
+        Math.round(ca[1] + (cb[1] - ca[1]) * u),
+        Math.round(ca[2] + (cb[2] - ca[2]) * u),
+      ]
+    }
+  }
+  return HEAT_STOPS[HEAT_STOPS.length - 1][1]
+}
+
+function makeHeatLayer(latlngs) {
+  const Heat = L.Layer.extend({
+    onAdd(map) {
+      this._map = map
+      const pane = map.getPanes().overlayPane
+      this._canvas = L.DomUtil.create('canvas', 'pathwatch-heat')
+      this._canvas.style.pointerEvents = 'none'
+      pane.insertBefore(this._canvas, pane.firstChild)
+      map.on('moveend viewreset zoomend resize', this._redraw, this)
+      this._redraw()
+    },
+    onRemove(map) {
+      L.DomUtil.remove(this._canvas)
+      map.off('moveend viewreset zoomend resize', this._redraw, this)
+    },
+    _redraw() {
+      const map = this._map
+      if (!map || !this._canvas) return
+      const size = map.getSize()
+      const topLeft = map.containerPointToLayerPoint([0, 0])
+      L.DomUtil.setPosition(this._canvas, topLeft)
+      const w = size.x
+      const h = size.y
+      this._canvas.width = w
+      this._canvas.height = h
+      const ctx = this._canvas.getContext('2d')
+      ctx.clearRect(0, 0, w, h)
+
+      const z = map.getZoom()
+      const radius = z >= 11
+        ? Math.max(22, Math.min(48, 14 + (z - 10) * 6))
+        : Math.max(14, Math.min(32, 8 + z * 2))
+
+      // 1) draw intensity as black alpha (no additive white blowout)
+      ctx.globalCompositeOperation = 'source-over'
+      for (const p of this._latlngs || []) {
+        const ll = numLatLon(p[0], p[1])
+        if (!ll) continue
+        const pt = map.latLngToContainerPoint(ll)
+        const inten = Math.min(1, Math.max(0.08, Number(p[2]) || 0.3))
+        const g = ctx.createRadialGradient(pt.x, pt.y, 0, pt.x, pt.y, radius)
+        g.addColorStop(0, `rgba(0,0,0,${0.55 * inten + 0.08})`)
+        g.addColorStop(0.55, `rgba(0,0,0,${0.22 * inten})`)
+        g.addColorStop(1, 'rgba(0,0,0,0)')
+        ctx.fillStyle = g
+        ctx.beginPath()
+        ctx.arc(pt.x, pt.y, radius, 0, Math.PI * 2)
+        ctx.fill()
+      }
+
+      // 2) colorize alpha → green/yellow/red/purple (like traffic heatmaps)
+      const img = ctx.getImageData(0, 0, w, h)
+      const d = img.data
+      for (let i = 0; i < d.length; i += 4) {
+        const a = d[i + 3]
+        if (!a) continue
+        const t = Math.min(1, a / 200)
+        const [r, g, b] = heatColorAt(t)
+        d[i] = r
+        d[i + 1] = g
+        d[i + 2] = b
+        d[i + 3] = Math.min(200, Math.round(a * 1.15))
+      }
+      ctx.putImageData(img, 0, 0)
+    },
+  })
+  const layer = new Heat()
+  layer._latlngs = latlngs
+  return layer
+}
+
 function HeatLayer({ points }) {
   const map = useMap()
-  const layerRef = useRef(null)
+  const key = (points || []).map(p => `${(+p[0]).toFixed(3)},${(+p[1]).toFixed(3)},${(+p[2] || 0).toFixed(2)}`).join('|')
 
   useEffect(() => {
     if (!points?.length) return
-    let cancelled = false
-    import('leaflet.heat').then(() => {
-      if (cancelled) return
-      if (layerRef.current) map.removeLayer(layerRef.current)
-      // leaflet.heat attaches to window.L automatically
-      const L = window.L
-      if (!L?.heatLayer) return
-      const heat = L.heatLayer(points, {
-        radius: 28,
-        blur: 22,
-        maxZoom: 9,
-        gradient: { 0.0: '#2196f3', 0.5: '#ffc107', 1.0: '#f44336' },
-      })
-      heat.addTo(map)
-      layerRef.current = heat
-    }).catch(() => {})
-    return () => {
-      cancelled = true
-      if (layerRef.current) { map.removeLayer(layerRef.current); layerRef.current = null }
-    }
-  }, [points, map])
+    const layer = makeHeatLayer(points)
+    layer.addTo(map)
+    return () => { map.removeLayer(layer) }
+  }, [map, key]) // eslint-disable-line react-hooks/exhaustive-deps
 
   return null
 }
 
-// ─── Map ─────────────────────────────────────────────────────────────────────
-function GeoMap({ points, heatPoints }) {
-  const grouped = Object.values(
-    (points || []).reduce((acc, g) => {
-      if (!g?.lat || !g?.lon) return acc
-      const k = `${g.lat},${g.lon}`
-      if (!acc[k]) acc[k] = { ...g, count: 0 }
-      acc[k].count++
-      return acc
-    }, {})
+function ViewController({ mode, remotes }) {
+  const map = useMap()
+  useEffect(() => {
+    const t = setTimeout(() => map.invalidateSize(), 80)
+    return () => clearTimeout(t)
+  }, [map])
+  useEffect(() => {
+    if (mode === 'area') {
+      map.fitBounds(ADDIS_BOUNDS, { padding: [16, 16], maxZoom: 12 })
+      return
+    }
+    const pts = remotes.map(r => [r.lat, r.lon]).filter(Boolean)
+    if (pts.length >= 2) {
+      try { map.fitBounds(pts, { padding: [40, 40], maxZoom: 4 }) } catch { map.setView([20, 10], 2) }
+    } else {
+      map.setView([20, 10], 2)
+    }
+  }, [mode, map]) // eslint-disable-line react-hooks/exhaustive-deps
+  return null
+}
+
+function buildHeatPoints(mode, live, data, score) {
+  const pts = []
+  const push = (lat, lon, inten) => {
+    const ll = numLatLon(lat, lon)
+    if (!ll) return
+    pts.push([ll[0], ll[1], Math.min(1, Math.max(0.08, Number(inten) || 0.25))])
+  }
+
+  if (mode === 'area') {
+    const city = data?.city_heat?.length ? data.city_heat : (data?.geo_heat || [])
+    if (city.length) {
+      for (const p of city) push(p.lat, p.lon, p.intensity)
+    } else {
+      // fallback until analysis loads — soft field around Addis
+      const base = Math.max(0.22, (score || 0) / 100)
+      const [vlat, vlon] = numLatLon(live?.vantage_lat, live?.vantage_lon) || DEFAULT_VANTAGE
+      for (let i = 0; i < 40; i++) {
+        const ang = (i / 40) * Math.PI * 2
+        const r = 0.02 + (i % 5) * 0.012
+        push(vlat + Math.cos(ang) * r, vlon + Math.sin(ang) * r * 1.1, base * (0.5 + (i % 3) * 0.15))
+      }
+    }
+    return pts
+  }
+
+  // world: every destination this machine reached
+  for (const p of data?.dest_heat || []) push(p.lat, p.lon, p.intensity)
+  for (const g of live?.live_geo || []) push(g.lat, g.lon, Math.min(0.7, 0.2 + (g.n || 1) / 20))
+  for (const p of data?.map_points || []) push(p.lat, p.lon, Math.min(0.65, 0.15 + (p.connections || 1) / 30))
+  return pts
+}
+
+function linkLabel(live) {
+  const conn = live?.connection || 'wifi'
+  const vpn  = live?.vpn === 'vpn' ? 'VPN on' : 'no VPN'
+  return `${conn} · ${vpn}`
+}
+
+function clockLabel(live) {
+  const raw = live?.local_time || live?.ts
+  if (!raw) return '—'
+  const d = new Date(raw)
+  if (Number.isNaN(d.getTime())) return raw
+  return d.toLocaleString(undefined, {
+    weekday: 'short', month: 'short', day: 'numeric',
+    hour: 'numeric', minute: '2-digit', second: '2-digit',
+  })
+}
+
+function GeoMap({ live, data, score }) {
+  const [mode, setMode] = useState('area')
+  const vantage = numLatLon(live?.vantage_lat, live?.vantage_lon) || DEFAULT_VANTAGE
+
+  const remotes = useMemo(() => {
+    const out = []
+    for (const g of live?.live_geo || []) {
+      const ll = numLatLon(g.lat, g.lon)
+      if (!ll) continue
+      out.push({ ...g, lat: ll[0], lon: ll[1] })
+    }
+    if (!out.length) {
+      for (const p of data?.map_points || []) {
+        const ll = numLatLon(p.lat, p.lon)
+        if (!ll) continue
+        out.push({
+          ip: p.remote_ip, lat: ll[0], lon: ll[1],
+          city: p.city, country: p.country, isp: p.isp, n: p.connections || 1,
+        })
+      }
+    }
+    return out
+  }, [live?.live_geo, data?.map_points])
+
+  const heatPoints = useMemo(
+    () => buildHeatPoints(mode, live, data, score),
+    [mode, live, data, score],
   )
 
+  const zones = mode === 'area'
+    ? (data?.throttle_areas?.length ? data.throttle_areas : [])
+    : []
+
+  const sc = scoreColor(score)
+  const sw = scoreWord(score)
+  const destCount = data?.path_meta?.destinations ?? data?.map_points?.length ?? remotes.length
+  const pathNote = data?.path_meta?.tod_slow
+    ? `Slower at ${data.path_meta.tod_slow.tod}`
+    : 'All sockets feed this heat'
+
   return (
-    // Center on Addis Ababa, zoom 4 so Ethiopia + nearby countries are visible
-    <MapContainer center={VANTAGE} zoom={4} className="map-canvas" attributionControl={true}>
-      {/* OpenStreetMap — no API key required */}
-      <TileLayer
-        url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
-        attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
-      />
+    <div className="map-wrap">
+      <MapContainer center={vantage} zoom={12} className="map-canvas" attributionControl>
+        <TileLayer
+          url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+          attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
+          maxZoom={19}
+        />
+        <ViewController mode={mode} remotes={remotes} />
+        {heatPoints.length > 0 && <HeatLayer points={heatPoints} />}
 
-      {/* Speed heatmap overlay */}
-      {heatPoints?.length > 0 && <HeatLayer points={heatPoints} />}
+        {zones.map((z, i) => {
+          const ll = numLatLon(z.lat, z.lon)
+          if (!ll) return null
+          const t = Math.min(1, Number(z.intensity) || 0.3)
+          return (
+            <Circle
+              key={`z-${i}`}
+              center={ll}
+              radius={z.radius_m || 3000}
+              pathOptions={{
+                color: 'transparent',
+                weight: 0,
+                fillColor: t >= 0.7 ? '#7c3aed' : t >= 0.45 ? '#6366f1' : '#3b82f6',
+                fillOpacity: 0.08 + t * 0.10,
+              }}
+            >
+              <Popup>
+                <div className="map-popup">
+                  <strong>{z.label || 'Path zone'}</strong>
+                  <div>Addis Ababa · all destinations</div>
+                  {z.tod_slow && <div className="map-popup-sub">Historically slower at {z.tod_slow.tod}</div>}
+                </div>
+              </Popup>
+            </Circle>
+          )
+        })}
 
-      {/* Your machine — vantage point */}
-      <CircleMarker
-        center={VANTAGE}
-        radius={8}
-        pathOptions={{ color: '#f85149', fillColor: '#f85149', fillOpacity: 1, weight: 2 }}
-      >
-        <Popup>
-          <div className="map-popup">
-            <strong>Your machine</strong>
-            <div>Addis Ababa, Ethiopia</div>
-            <div className="map-popup-sub">SAFARICOM / STEP ISP</div>
-          </div>
-        </Popup>
-      </CircleMarker>
-
-      {/* Remote IPs your apps connect to */}
-      {grouped.map((p, i) => (
-        <CircleMarker key={i} center={[p.lat, p.lon]}
-          radius={Math.min(3 + p.count * 1.5, 18)}
-          pathOptions={{ color: '#4a9ef7', fillColor: '#4a9ef7', fillOpacity: 0.7, weight: 0 }}
+        <CircleMarker
+          center={vantage}
+          radius={8}
+          pathOptions={{ color: '#fff', fillColor: '#f85149', fillOpacity: 1, weight: 2 }}
         >
           <Popup>
             <div className="map-popup">
-              <strong>{p.city || p.country || p.ip}</strong>
-              {p.isp && <div>{p.isp}</div>}
-              <div className="map-popup-sub">{p.count} connection{p.count !== 1 ? 's' : ''}</div>
+              <strong>Your machine</strong>
+              <div>{live?.vantage_city || 'Addis Ababa'}</div>
+              <div className="map-popup-sub">{linkLabel(live)} · {live?.tod || ''}</div>
+              <div className="map-popup-sub">{destCount} destinations in the model</div>
             </div>
           </Popup>
         </CircleMarker>
-      ))}
-    </MapContainer>
+
+        {mode === 'world' && remotes.map((p) => (
+          <CircleMarker
+            key={p.ip || `${p.lat},${p.lon}`}
+            center={[p.lat, p.lon]}
+            radius={Math.min(4 + (p.n || 1), 12)}
+            pathOptions={{ color: '#238636', fillColor: '#58a6ff', fillOpacity: 0.85, weight: 1 }}
+          >
+            <Popup>
+              <div className="map-popup">
+                <strong>{p.city || p.country || p.ip}</strong>
+                {p.isp && <div>{p.isp}</div>}
+                <div className="map-popup-sub">{p.ip} · {p.n || 1} socket{(p.n || 1) !== 1 ? 's' : ''}</div>
+              </div>
+            </Popup>
+          </CircleMarker>
+        ))}
+      </MapContainer>
+
+      <div className="map-hud">
+        <div className="map-hud-time">{clockLabel(live)}</div>
+        <div className="map-hud-row">{linkLabel(live)}{live?.tod ? ` · ${live.tod}` : ''}</div>
+        {live?.ssid ? <div className="map-hud-row">{live.ssid}</div> : null}
+        <div className="map-hud-row">{destCount} destinations · all sockets</div>
+        <div className="map-hud-row">{pathNote}</div>
+        <div className="map-hud-score" style={{ color: sc }}>{sw} · {score ?? 0}</div>
+      </div>
+
+      <div className="map-view-toggle">
+        <button className={mode === 'area' ? 'on' : ''} onClick={() => setMode('area')}>Addis Ababa</button>
+        <button className={mode === 'world' ? 'on' : ''} onClick={() => setMode('world')}>All destinations</button>
+      </div>
+    </div>
   )
 }
 
@@ -378,20 +615,20 @@ export default function App() {
         {/* ── map ── */}
         {tab === 'map' && <>
           <div className="map-legend-row">
-            <span><i className="leg-dot" style={{ background: '#f85149', borderRadius: '50%', display: 'inline-block', width: 8, height: 8, marginRight: 5 }} />Your machine (Addis Ababa)</span>
-            <span><i className="leg-dot" style={{ background: '#4a9ef7', borderRadius: '50%', display: 'inline-block', width: 8, height: 8, marginRight: 5 }} />Remote server</span>
-            <span style={{ color: 'var(--text-3)' }}>Heat = speed (blue fast → red slow)</span>
+            <span><i className="leg-dot" style={{ background: '#f85149', borderRadius: '50%', display: 'inline-block', width: 8, height: 8, marginRight: 5 }} />Your machine</span>
+            <span className="heat-scale">
+              <span className="heat-scale-bar" />
+              Addis path heat — all sockets (green ok → purple throttled)
+            </span>
           </div>
           <div className="card" style={{ padding: 0, overflow: 'hidden' }}>
             <div className="card-head-bar">
-              <Section title="Live connections" right={`${live?.live_geo?.length ?? 0} geo-located · ${live?.active_count ?? 0} total sockets`} />
+              <Section
+                title="Addis Ababa — path heat"
+                right={`${data?.path_meta?.destinations ?? live?.live_geo?.length ?? 0} destinations · ${live?.active_count ?? 0} sockets · ${live?.tod || ''} · ${live?.vpn === 'vpn' ? 'VPN' : 'no VPN'} · ${live?.connection || ''}`}
+              />
             </div>
-            <GeoMap
-              points={live?.live_geo}
-              heatPoints={(data?.map_points || [])
-                .filter(p => p.lat && p.lon)
-                .map(p => [p.lat, p.lon, Math.min(p.connections / 20, 1)])}
-            />
+            <GeoMap live={live} data={data} score={score} />
           </div>
           {data?.isp_analysis?.length > 0 && (
             <div className="card" style={{ marginTop: 12 }}>

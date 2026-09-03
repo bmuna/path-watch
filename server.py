@@ -70,10 +70,14 @@ async def ws_live(ws: WebSocket):
                     "session_total_fmt":  s.get("session_total_fmt") or "0 B",
                     "apps":               s.get("apps") or [],
                     "ts":                 s.get("ts")   or "",
+                    "local_time":         net.get("detected_at") or "",
                     "throttle_score":     score.get("score", 0),
                     "throttle_reason":    score.get("reason", ""),
                     "baseline_down":      score.get("baseline_down"),
                     "live_geo":           s.get("live_geo") or [],
+                    "vantage_lat":        getattr(cfg, "VANTAGE_LAT", 9.0245),
+                    "vantage_lon":        getattr(cfg, "VANTAGE_LON", 38.7485),
+                    "vantage_city":       getattr(cfg, "VANTAGE_CITY", "Addis Ababa"),
                 }
                 await ws.send_text(json.dumps(payload))
             await asyncio.sleep(2.0)

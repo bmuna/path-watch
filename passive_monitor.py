@@ -67,6 +67,44 @@ def fmt_bytes(n: int) -> str:
     if n >= 1_000:         return f"{n/1e3:.1f} KB"
     return f"{n} B"
 
+
+def _live_geo(conns: list) -> list[dict]:
+    out = []
+    seen = set()
+    for c in conns:
+        ip = c.get("remote_ip")
+        if not ip or ip in seen:
+            continue
+        g = geo.get(ip)
+        if not g:
+            continue
+        try:
+            lat = float(g["lat"])
+            lon = float(g["lon"])
+        except (TypeError, ValueError, KeyError):
+            continue
+        seen.add(ip)
+        out.append({
+            "ip": ip,
+            "lat": lat,
+            "lon": lon,
+            "city": g.get("city") or "",
+            "country": g.get("country") or "",
+            "isp": g.get("isp") or "",
+            "org": g.get("org") or "",
+            "asn": g.get("asn") or "",
+            "n": 1,
+        })
+    # connection counts
+    counts = {}
+    for c in conns:
+        ip = c.get("remote_ip")
+        if ip:
+            counts[ip] = counts.get(ip, 0) + 1
+    for row in out:
+        row["n"] = counts.get(row["ip"], 1)
+    return out
+
 def pretty_name(raw: str) -> str:
     for s in (" Helper (Renderer)", " Helper (GPU)", " Helper"):
         if raw.endswith(s):
@@ -407,12 +445,8 @@ class TrafficMonitor:
             "iface":              iface,
             "ts":                 ts,
             "throttle_score":     ts_score,
-            # live geo feed for map: all currently known IPs
-            "live_geo":           [
-                {"ip": c["remote_ip"], **geo.get(c["remote_ip"])}
-                for c in conns
-                if geo.get(c["remote_ip"])
-            ],
+            # live geo: only IPs with real lat/lng
+            "live_geo":           _live_geo(conns),
         }
         if self.on_tick:
             try:

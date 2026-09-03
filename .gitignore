@@ -12,3 +12,6 @@ mw_results.csv
 clf_report.txt
 .live_collector.pid
 .live_collector.log
+frontend/dist/
+frontend/node_modules/
+.streamlit/

@@ -1,12 +1,7 @@
 pandas>=2.0
 numpy
 scipy
-scikit-learn
-streamlit
-plotly
 psutil
-customtkinter
-pillow
 fastapi
 uvicorn[standard]
 websockets
