@@ -41,16 +41,21 @@ def time_of_day(now: datetime | None = None) -> str:
 
 
 def detect_vpn() -> tuple[str, str]:
-    """Return ('vpn'|'novpn', reason)."""
+    """Return ('vpn'|'novpn', reason).
+
+    Only treat VPN as on when a tunnel is actually connected — not merely
+    because a VPN app process is sitting in the background.
+    """
     system = platform.system()
 
     if system == "Darwin":
-        # Connected entries in Network Extension / scutil
         sc = _run(["scutil", "--nc", "list"])
         for line in sc.splitlines():
-            if "(Connected)" in line or "Connected" in line and "PPP" in line:
+            if "(Connected)" in line:
                 return "vpn", "scutil shows a connected VPN service"
-        # utun interfaces with an inet address are the usual WireGuard/OpenVPN tell
+            if "Connected" in line and "PPP" in line:
+                return "vpn", "scutil PPP connected"
+        # utun with a real inet address (WireGuard / OpenVPN / etc.)
         ifc = _run(["ifconfig"])
         for block in re.split(r"\n(?=\w)", ifc):
             if not block.startswith("utun"):
@@ -58,14 +63,8 @@ def detect_vpn() -> tuple[str, str]:
             if re.search(r"\binet\s+\d", block):
                 name = block.split(":", 1)[0]
                 return "vpn", f"{name} has an address"
-        # common VPN apps running
-        ps = _run(["ps", "-A", "-o", "comm="])
-        for needle in ("openvpn", "wireguard", "wg-quick", "nordvpn", "expressvpn", "surfshark", "mullvad", "cloudflared"):
-            if needle.lower() in ps.lower():
-                return "vpn", f"process looks like {needle}"
-        return "novpn", "no utun address / connected scutil VPN"
+        return "novpn", "no connected VPN service / utun inet"
 
-    # linux: tun/wg interfaces
     ip_out = _run(["ip", "-br", "addr"])
     for line in ip_out.splitlines():
         name = line.split()[0] if line.split() else ""
@@ -74,17 +73,34 @@ def detect_vpn() -> tuple[str, str]:
     return "novpn", "no tun/wg interface up"
 
 
+def _default_gateway() -> str | None:
+    if platform.system() == "Darwin":
+        out = _run(["route", "-n", "get", "default"])
+        m = re.search(r"gateway:\s*(\S+)", out)
+        return m.group(1) if m else None
+    out = _run(["ip", "route", "show", "default"])
+    m = re.search(r"via\s+(\S+)", out)
+    return m.group(1) if m else None
+
+
 def _wifi_ssid() -> str | None:
     if platform.system() != "Darwin":
         return None
-    # modern macos
+    # Prefer networksetup — getsummary can keep a stale SSID after switching
+    out = _run(["networksetup", "-getairportnetwork", "en0"])
+    if "You are not associated" in out:
+        # still try other wifi devices
+        for dev in ("en1", "en2"):
+            out2 = _run(["networksetup", "-getairportnetwork", dev])
+            if "Current Wi-Fi Network:" in out2:
+                return out2.split("Current Wi-Fi Network:", 1)[1].strip()
+        return None
+    if "Current Wi-Fi Network:" in out:
+        return out.split("Current Wi-Fi Network:", 1)[1].strip()
     out = _run(["ipconfig", "getsummary", "en0"])
     m = re.search(r"SSID\s*:\s*(.+)", out)
     if m:
         return m.group(1).strip()
-    out = _run(["networksetup", "-getairportnetwork", "en0"])
-    if "Current Wi-Fi Network:" in out:
-        return out.split("Current Wi-Fi Network:", 1)[1].strip()
     return None
 
 
@@ -101,13 +117,15 @@ def _default_iface() -> str | None:
 def detect_connection() -> tuple[str, str]:
     """Return ('wifi'|'hotspot'|'ethernet', reason)."""
     iface = _default_iface() or ""
+    gw = _default_gateway() or ""
     ssid = _wifi_ssid()
 
-    # ethernet-ish names
-    if iface.startswith("en") and platform.system() == "Darwin":
-        # en0 is usually wifi on laptops; en1+ often thunderbolt/ethernet
-        # if we have an SSID on the default iface path, call it wifi/hotspot
-        pass
+    # iPhone Personal Hotspot always NATs at 172.20.10.1
+    if gw.startswith("172.20.10."):
+        return "hotspot", f"default gateway {gw} (iPhone hotspot)"
+    # common Android tether gateways
+    if gw in ("192.168.43.1", "192.168.42.129", "192.168.137.1"):
+        return "hotspot", f"default gateway {gw} (phone tether)"
 
     if ssid:
         low = ssid.lower()
@@ -125,8 +143,6 @@ def detect_connection() -> tuple[str, str]:
         return "wifi", f"wifi SSID={ssid}"
 
     if iface.startswith(("eth", "en")) and not ssid:
-        # no SSID — likely wired, map to wifi bucket? keep ethernet as wifi for labels
-        # our labels only allow wifi|hotspot — treat wired as wifi (home lan)
         if iface and not iface.startswith("en0"):
             return "wifi", f"wired/default iface {iface} (logged as wifi)"
         return "wifi", f"default iface {iface or 'unknown'}, no SSID"
