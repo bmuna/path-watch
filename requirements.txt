@@ -7,3 +7,6 @@ plotly
 psutil
 customtkinter
 pillow
+fastapi
+uvicorn[standard]
+websockets
