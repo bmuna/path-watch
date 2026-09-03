@@ -45,18 +45,50 @@ Open **http://localhost:5173**
 Leave the monitor running. Use the internet normally. For contrast, switch
 VPN on/off and wifi ↔ hotspot while it logs.
 
-## Findings so far (passive logs)
+## Findings so far (passive `speed_log.csv`, one evening in Addis)
 
-From `speed_log.csv` on the same day (wifi, no VPN):
+Heuristic / statistical summary only — not a trained model. Timing is not
+proof of ISP intent.
 
-- **Afternoon** (`wifi_novpn_afternoon`): median down ≈ **0.20 Mbps**
-- **Evening** (`wifi_novpn_evening`): median down ≈ **0.08 Mbps**
-- Link looks **bursty** (peak tens of Mbps vs low median)
+**VPN-on vs off (wifi, evening — same TOD bucket)**
 
-**VPN and hotspot contrast still needed to distinguish throttling from
-ordinary time-of-day congestion.** Until those labeled sessions exist, treat
-the evening slowdown as a timing/congestion signal only — not differential
-treatment evidence.
+| Condition | n | median ↓ Mbps | mean ↓ Mbps |
+|-----------|---|---------------|-------------|
+| `wifi_novpn_evening` | 3812 | 0.091 | 1.027 |
+| `wifi_vpn_evening` | 1091 | 0.283 | 0.540 |
+
+Median download is ~3.1× higher with VPN on. Means go the other way (no-VPN
+mean inflated by rare bursts; peak ~41 Mbps). Mann-Whitney in
+`analyze_all()`: p ≈ 0.
+
+**Time-of-day (wifi, no VPN)**
+
+| Condition | n | median ↓ Mbps |
+|-----------|---|---------------|
+| `wifi_novpn_afternoon` | 213 | 0.205 |
+| `wifi_novpn_evening` | 3812 | 0.091 |
+
+Evening/afternoon median ratio ≈ **0.44**. There is **no** `wifi_vpn_afternoon`
+sample, so we cannot say whether that TOD gap shrinks under VPN. Proxy: at
+evening, VPN-on median (0.283) is *above* afternoon no-VPN (0.205) — the
+evening slump seen without VPN is not visible in the VPN-on evening session.
+
+**Hotspot vs wifi (no VPN)**
+
+| Condition | n | median ↓ Mbps | mean ↓ Mbps |
+|-----------|---|---------------|-------------|
+| `wifi_novpn_evening` | 3812 | 0.091 | 1.027 |
+| `hotspot_novpn_evening` | 394 | 0.058 | 0.134 |
+| `hotspot_novpn_night` | 265 | 0.188 | 0.517 |
+| hotspot all (novpn) | 659 | 0.079 | 0.288 |
+| wifi all (novpn) | 4025 | 0.096 | 0.993 |
+
+Evening hotspot is slower than evening wifi on median. Night hotspot recovered
+somewhat (different hour, still cellular).
+
+**Still thin:** afternoon n=213; no VPN-on afternoon; one home, one evening.
+Overnight/morning wifi samples would strengthen TOD. Next step (not built):
+train a sequence model once enough labeled session data exists.
 
 ## Config
 
