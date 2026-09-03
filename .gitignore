@@ -12,6 +12,9 @@ mw_results.csv
 clf_report.txt
 .live_collector.pid
 .live_collector.log
+.monitor_watchdog.log
+.monitor_watchdog.pid
+.monitor_uvicorn.log
 frontend/dist/
 frontend/node_modules/
 .streamlit/
