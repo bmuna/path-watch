@@ -1,33 +1,33 @@
 #!/usr/bin/env python3
 # streamlit run dashboard.py
 #
-# reads the csv the collector writes. not a live sniffer.
+# Live view of what this PC is doing on the network + the metrics log.
 
 from __future__ import annotations
 
 import os
+import signal
+import subprocess
+import sys
+import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 
 import config as cfg
-from analyze_metrics import (
-    condition_contrast,
-    describe_groups,
-    gru_data_check,
-    load_df,
-    ping_rows,
-    suspect_vs_baseline,
-    train_baseline,
-    vpn_gap_shrink,
-)
+from analyze_metrics import load_df, ping_rows, suspect_vs_baseline, train_baseline, vpn_gap_shrink
+from network_status import snapshot
 
-st.set_page_config(page_title="isp timing", layout="wide")
+ROOT = Path(__file__).resolve().parent
+PID_FILE = ROOT / ".live_collector.pid"
+
+st.set_page_config(page_title="path watch", layout="wide")
 
 
-@st.cache_data(ttl=20)
+@st.cache_data(ttl=8)
 def get_df(path: str, mtime: float) -> pd.DataFrame:
     if not os.path.exists(path):
         return pd.DataFrame()
@@ -41,69 +41,217 @@ def csv_mtime(path: str) -> float:
         return 0.0
 
 
-def fmt_p(p):
-    if p is None or pd.isna(p):
-        return "—"
-    if p < 0.001:
-        return f"{p:.1e}"
-    return f"{p:.3f}"
+def collector_running() -> bool:
+    if not PID_FILE.exists():
+        return False
+    try:
+        pid = int(PID_FILE.read_text().strip())
+        os.kill(pid, 0)
+        return True
+    except Exception:
+        return False
 
 
-st.sidebar.title("log")
-csv_path = st.sidebar.text_input("csv", cfg.CSV_FILE)
-if st.sidebar.button("reload"):
-    st.cache_data.clear()
+def start_collector(csv_path: str, interval: float = 12.0) -> str:
+    if collector_running():
+        return "already running"
+    py = ROOT / ".venv" / "bin" / "python"
+    if not py.exists():
+        py = Path(sys.executable)
+    log = open(ROOT / ".live_collector.log", "a")
+    proc = subprocess.Popen(
+        [str(py), str(ROOT / "collect_metrics.py"), "--auto", "--watch", "--interval", str(interval), "--csv", csv_path],
+        cwd=str(ROOT),
+        stdout=log,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    PID_FILE.write_text(str(proc.pid))
+    return f"started pid {proc.pid}"
+
+
+def stop_collector() -> str:
+    if not PID_FILE.exists():
+        return "not running"
+    try:
+        pid = int(PID_FILE.read_text().strip())
+        os.kill(pid, signal.SIGTERM)
+    except Exception as e:
+        PID_FILE.unlink(missing_ok=True)
+        return f"cleared ({e})"
+    PID_FILE.unlink(missing_ok=True)
+    return "stopped"
+
+
+def dest_name(host: str) -> str:
+    return cfg.TARGET_META.get(host, {}).get("label", host)
+
+
+def probe_once(csv_path: str) -> str:
+    py = ROOT / ".venv" / "bin" / "python"
+    if not py.exists():
+        py = Path(sys.executable)
+    r = subprocess.run(
+        [str(py), str(ROOT / "collect_metrics.py"), "--auto", "--once", "--csv", csv_path],
+        cwd=str(ROOT),
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    if r.returncode != 0:
+        return (r.stderr or r.stdout or "probe failed")[-400:]
+    return "ok"
+
+
+# --- sidebar -----------------------------------------------------------------
+st.sidebar.title("path watch")
+csv_path = st.sidebar.text_input("data file", cfg.CSV_FILE)
+auto_refresh = st.sidebar.toggle("auto-refresh", value=True)
+st.sidebar.caption("refreshes about every 8s while open")
+
+page = st.sidebar.radio("page", ["live", "history", "learn", "notes"])
 
 mtime = csv_mtime(csv_path)
 df = get_df(csv_path, mtime)
+ping = ping_rows(df) if not df.empty else pd.DataFrame()
 
-page = st.sidebar.radio(
-    "page",
-    ["latest", "time series", "tests", "classifier", "notes"],
-)
+# detect now (always)
+with st.spinner("checking this PC…"):
+    now = snapshot()
 
-if df.empty:
-    st.warning(
-        f"empty csv (`{csv_path}`). run the collector first:\n\n"
-        "`python collect_metrics.py --connection wifi --vpn novpn --tod evening`"
+# --- LIVE --------------------------------------------------------------------
+if page == "live":
+    st.title("What's happening now")
+    st.caption("Auto-detects wifi/hotspot, VPN, and time of day on this machine, then logs timing to the CSV.")
+
+    a, b, c, d = st.columns(4)
+    a.metric("Connection", now["connection"])
+    b.metric("VPN", "ON" if now["vpn"] == "vpn" else "OFF")
+    c.metric("Time of day", now["tod"])
+    d.metric("Public IP", now.get("public_ip") or "—")
+
+    st.write(
+        f"**Label this round would use:** `{now['label']}`  ·  "
+        f"SSID `{now.get('ssid') or '—'}`  ·  iface `{now.get('iface') or '—'}`  ·  "
+        f"country `{now.get('ip_country') or '—'}`"
     )
-    if page != "notes":
-        st.stop()
-
-if not df.empty:
-    n_runs = df["run_id"].nunique() if "run_id" in df else 0
-    st.sidebar.caption(f"{len(df)} rows · {n_runs} runs")
-    if mtime:
-        st.sidebar.caption("file updated " + datetime.fromtimestamp(mtime, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))
-
-
-if page == "latest":
-    st.header("latest round")
-    ping = ping_rows(df)
-    last_run = ping["run_id"].iloc[-1]
-    last_round = ping.loc[ping["run_id"] == last_run, "round_idx"].max()
-    snap = ping[(ping["run_id"] == last_run) & (ping["round_idx"] == last_round)]
-    label = snap["label"].iloc[0] if len(snap) else "?"
-    st.caption(f"run `{last_run}` · round {int(last_round)} · {label}")
-
-    show = snap[["target", "role", "rtt_avg", "rtt_min", "rtt_max", "jitter", "loss_pct", "method"]].copy()
-    st.dataframe(show, use_container_width=True, hide_index=True)
-
-    tp = df[(df["role"] == "throughput") & (df["run_id"] == last_run)]
-    if len(tp):
-        last_tp = tp.iloc[-1]
-        st.metric("last 1MB sample (Mbps)", last_tp.get("throughput_mbps"))
+    st.caption(f"why connection: {now['connection_reason']}  |  why vpn: {now['vpn_reason']}")
 
     c1, c2, c3 = st.columns(3)
-    ping_ok = ping.dropna(subset=["rtt_avg"])
     with c1:
-        st.metric("runs logged", int(n_runs))
+        if st.button("Probe once now", type="primary", use_container_width=True):
+            with st.spinner("pinging targets…"):
+                msg = probe_once(csv_path)
+            st.cache_data.clear()
+            if msg == "ok":
+                st.success("Saved one round to the log.")
+            else:
+                st.error(msg)
+            time.sleep(0.3)
+            st.rerun()
     with c2:
-        st.metric("median RTT (ms), all ping rows", f"{ping_ok['rtt_avg'].median():.1f}" if len(ping_ok) else "—")
+        running = collector_running()
+        if running:
+            if st.button("Stop live logging", use_container_width=True):
+                st.info(stop_collector())
+                st.rerun()
+        else:
+            if st.button("Start live logging", use_container_width=True):
+                st.info(start_collector(csv_path))
+                st.rerun()
     with c3:
-        st.metric("labels", ping["label"].nunique() if "label" in ping else 0)
+        st.metric("Logger", "RUNNING" if collector_running() else "stopped")
 
-    st.subheader("runs")
+    st.divider()
+
+    if ping.empty:
+        st.warning("No measurements yet. Hit **Probe once now** or **Start live logging**.")
+    else:
+        last_run = ping["run_id"].iloc[-1]
+        last_round = int(ping.loc[ping["run_id"] == last_run, "round_idx"].max())
+        snap = ping[(ping["run_id"] == last_run) & (ping["round_idx"] == last_round)].copy()
+        snap["destination"] = snap["target"].map(dest_name)
+
+        st.subheader("Latest measurements")
+        st.caption(
+            f"run `{last_run}` · round {last_round} · label `{snap['label'].iloc[0]}` · "
+            f"{snap['ts'].iloc[0]}"
+        )
+
+        show = snap[["destination", "role", "rtt_avg", "jitter", "loss_pct", "method"]].rename(
+            columns={"rtt_avg": "rtt_ms", "jitter": "jitter_ms", "loss_pct": "loss_%"}
+        )
+        st.dataframe(show, use_container_width=True, hide_index=True)
+
+        m1, m2, m3, m4 = st.columns(4)
+        ok = snap.dropna(subset=["rtt_avg"])
+        base = ok[ok["role"] == "baseline"]["rtt_avg"]
+        sus = ok[ok["role"] == "suspect"]["rtt_avg"]
+        m1.metric("Baseline median RTT", f"{base.median():.0f} ms" if len(base) else "—")
+        m2.metric("Suspect median RTT", f"{sus.median():.0f} ms" if len(sus) else "—")
+        gap = (sus.median() - base.median()) if len(base) and len(sus) else None
+        m3.metric("Gap (suspect − DNS)", f"{gap:+.0f} ms" if gap is not None else "—")
+        m4.metric("Rows in log", len(df))
+
+        st.subheader("This session")
+        one = ping[ping["run_id"] == last_run].copy()
+        one["destination"] = one["target"].map(dest_name)
+        fig = px.line(
+            one.dropna(subset=["rtt_avg"]),
+            x="elapsed_s",
+            y="rtt_avg",
+            color="destination",
+            markers=True,
+            labels={"elapsed_s": "seconds into run", "rtt_avg": "RTT (ms)"},
+        )
+        fig.update_layout(height=360, margin=dict(l=20, r=20, t=30, b=20), legend_title_text="")
+        st.plotly_chart(fig, use_container_width=True)
+
+        tp = df[(df["role"] == "throughput") & (df["run_id"] == last_run)].dropna(subset=["throughput_mbps"])
+        if len(tp):
+            st.metric("Last 1MB download", f"{tp.iloc[-1]['throughput_mbps']} Mbps")
+
+    if auto_refresh:
+        time.sleep(8)
+        st.rerun()
+
+
+# --- HISTORY -----------------------------------------------------------------
+elif page == "history":
+    st.title("History")
+    if ping.empty:
+        st.info("Nothing logged yet.")
+        st.stop()
+
+    ping = ping.copy()
+    ping["destination"] = ping["target"].map(dest_name)
+
+    st.subheader("By condition")
+    heat = ping.pivot_table(index="destination", columns="label", values="rtt_avg", aggfunc="median")
+    if not heat.empty:
+        fig = px.imshow(
+            heat,
+            text_auto=".0f",
+            aspect="auto",
+            color_continuous_scale="Tealgrn",
+            labels=dict(color="ms"),
+        )
+        fig.update_layout(height=360, margin=dict(l=20, r=20, t=30, b=20))
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.subheader("RTT over time")
+    fig = px.scatter(
+        ping.dropna(subset=["rtt_avg", "ts"]),
+        x="ts",
+        y="rtt_avg",
+        color="label",
+        symbol="destination",
+        labels={"ts": "time", "rtt_avg": "RTT (ms)"},
+    )
+    fig.update_layout(height=420, margin=dict(l=20, r=20, t=30, b=20), legend_title_text="")
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.subheader("Sessions")
     summary = (
         ping.groupby(["run_id", "label"], dropna=False)
         .agg(rounds=("round_idx", "nunique"), start=("ts", "min"), median_rtt=("rtt_avg", "median"))
@@ -112,205 +260,64 @@ if page == "latest":
     )
     st.dataframe(summary, use_container_width=True, hide_index=True)
 
-    missing = []
-    for conn in cfg.CONNECTION_CHOICES:
-        for vpn in cfg.VPN_CHOICES:
-            for tod in ("morning", "evening"):
-                lab = f"{conn}_{vpn}_{tod}"
-                if lab not in set(ping["label"].unique()):
-                    missing.append(lab)
-    if missing:
-        st.info("haven't run these yet: " + ", ".join(missing))
 
+# --- LEARN -------------------------------------------------------------------
+elif page == "learn":
+    st.title("What the data says")
+    st.caption("Same checks as analyze_metrics.py. Needs contrasting runs (vpn on/off, wifi/hotspot, morning/evening).")
 
-elif page == "time series":
-    st.header("RTT over time")
-    ping = ping_rows(df).dropna(subset=["rtt_avg", "ts"])
-    if ping.empty:
-        st.write("no RTT values")
+    if ping.empty or ping["run_id"].nunique() < 1:
+        st.info("Collect more first.")
         st.stop()
 
-    targets = st.multiselect("targets", sorted(ping["target"].unique()), default=sorted(ping["target"].unique()))
-    labels = st.multiselect("labels", sorted(ping["label"].unique()), default=sorted(ping["label"].unique()))
-    metric = st.radio("metric", ["rtt_avg", "jitter", "loss_pct"], horizontal=True)
-    view = ping[ping["target"].isin(targets) & ping["label"].isin(labels)]
-
-    fig = px.scatter(
-        view,
-        x="ts",
-        y=metric,
-        color="label",
-        symbol="target",
-        hover_data=["run_id", "method", "connection", "vpn", "tod"],
-        labels={"ts": "time (UTC)", metric: metric.replace("_", " ") + (" (ms)" if metric != "loss_pct" else " (%)")},
-        title=None,
-    )
-    fig.update_traces(marker=dict(size=7, opacity=0.75))
-    fig.update_layout(height=480, legend_title_text="")
-    st.plotly_chart(fig, use_container_width=True)
-
-    st.caption("one point = one target in one round. color is the condition.")
-
-    st.subheader("one run")
-    runs = ping["run_id"].unique().tolist()
-    pick = st.selectbox("run", runs, index=len(runs) - 1)
-    one = ping[ping["run_id"] == pick]
-    fig2 = px.line(
-        one,
-        x="elapsed_s",
-        y="rtt_avg",
-        color="target",
-        labels={"elapsed_s": "seconds into run", "rtt_avg": "RTT (ms)"},
-    )
-    fig2.update_layout(height=360, legend_title_text="")
-    st.plotly_chart(fig2, use_container_width=True)
-
-    tp = df[(df["role"] == "throughput") & (df["run_id"] == pick)].dropna(subset=["throughput_mbps"])
-    if len(tp):
-        fig3 = px.scatter(
-            tp,
-            x="elapsed_s",
-            y="throughput_mbps",
-            labels={"elapsed_s": "seconds into run", "throughput_mbps": "Mbps"},
-            title="1MB samples, this run",
-        )
-        fig3.update_layout(height=280)
-        st.plotly_chart(fig3, use_container_width=True)
-
-
-elif page == "tests":
-    st.header("comparisons")
-    st.caption(
-        "mann-whitney U (one-sided: is the suspect slower than the dns baselines) "
-        "inside each label. I didn't correct for multiple tests."
-    )
-    min_n = st.sidebar.number_input("min n", 5, 50, 8)
-
-    vs = suspect_vs_baseline(df, min_n=min_n)
+    vs = suspect_vs_baseline(df, min_n=5)
+    st.subheader("Suspect vs DNS baseline")
     if vs.empty:
-        st.write("not enough rows for the tests yet.")
+        st.write("Not enough samples yet.")
     else:
-        vs = vs.copy()
-        vs["rtt_p"] = vs["rtt_p"].map(fmt_p)
-        vs["jitter_p"] = vs["jitter_p"].map(fmt_p)
-        st.subheader("suspect vs dns baseline")
         st.dataframe(vs, use_container_width=True, hide_index=True)
 
-    shrink = vpn_gap_shrink(df, min_n=min_n)
-    st.subheader("vpn on vs off")
-    st.caption(
-        "gap = median suspect rtt minus median baseline rtt. "
-        "`signature` is just a flag: off-vpn gap has p<0.05 and shrinks by >10ms (or 20%) with vpn. "
-        "not the same as proving anyone targeted a service."
-    )
+    st.subheader("Does the gap shrink on VPN?")
+    shrink = vpn_gap_shrink(df, min_n=5)
     if shrink.empty:
-        st.write("need a vpn run and a no-vpn run on the same connection + time of day.")
+        st.write("Need matched vpn + no-vpn runs on the same connection and time of day.")
     else:
         st.dataframe(shrink, use_container_width=True, hide_index=True)
 
-    con = condition_contrast(df, min_n=min_n)
-    st.subheader("other contrasts")
-    if con.empty:
-        st.write("need both sides (wifi and hotspot, or vpn and not, or morning and evening).")
-    else:
-        con = con.copy()
-        con["p"] = con["p"].map(fmt_p)
-        st.dataframe(con, use_container_width=True, hide_index=True)
-
-    st.subheader("group means")
-    desc = describe_groups(df)
-    st.dataframe(desc, use_container_width=True, hide_index=True)
-
-
-elif page == "classifier":
-    st.header("classifier")
-    st.caption(
-        "logreg and a random forest predicting wifi/hotspot (or vpn, or time of day) "
-        "from rtt/jitter/loss. just checking if there's any signal. "
-        "cv accuracy vs majority class. majority class is the thing to beat."
-    )
-    y_col = st.selectbox("predict", ["connection", "vpn", "tod", "label"])
-    res = train_baseline(df, y_col=y_col)
+    st.subheader("Can a simple model tell wifi from hotspot?")
+    res = train_baseline(df, y_col="connection")
     if not res or not res.get("ok"):
-        st.write("skipped:", (res or {}).get("reason", "not enough data"))
+        st.write("Skipped:", (res or {}).get("reason", "need more data"))
     else:
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("n (rounds)", res["n"])
-        c2.metric("majority class", f"{res['majority_baseline']:.2f}")
-        c3.metric("logreg CV acc", f"{res['logreg_acc_mean']:.2f}")
-        c4.metric("random forest CV acc", f"{res['rf_acc_mean']:.2f}")
-        st.write("classes:", res["classes"])
-
-        left, right = st.columns(2)
-        with left:
-            st.subheader("logreg |coef|")
-            st.dataframe(
-                pd.Series(res["logreg_top"], name="abs_coef").rename_axis("feature").reset_index(),
-                hide_index=True,
-                use_container_width=True,
-            )
-        with right:
-            st.subheader("rf importance")
-            st.dataframe(
-                pd.Series(res["rf_top"], name="importance").rename_axis("feature").reset_index(),
-                hide_index=True,
-                use_container_width=True,
-            )
-        st.text(res["report"])
-
-        if res["rf_acc_mean"] <= res["majority_baseline"] + 0.03:
-            st.info(
-                "forest is basically guessing the majority class. either the timing "
-                "doesn't separate these conditions, or I need more runs."
-            )
-
-    gc = gru_data_check(df)
-    st.subheader("sequence model")
-    st.write(gc)
-    if not gc["justified"]:
-        st.write(
-            "not training a gru on this csv, runs aren't long enough for "
-            "onset-during-session to be a real thing to model."
-        )
+        c1, c2, c3 = st.columns(3)
+        c1.metric("rounds", res["n"])
+        c2.metric("majority baseline", f"{res['majority_baseline']:.2f}")
+        c3.metric("random forest CV", f"{res['rf_acc_mean']:.2f}")
+        st.write("Top features:", res["rf_top"])
 
 
-elif page == "notes":
-    st.header("notes")
+# --- NOTES -------------------------------------------------------------------
+else:
+    st.title("How this works")
     st.markdown(
-        """
-One home network. ICMP (or TCP connect if ping is blocked) to a few hosts,
-plus a 1MB download sample, tagged with wifi/hotspot, vpn or not, time of day.
+        f"""
+1. **Detect** — this PC's wifi/hotspot, VPN, and time of day (`network_status.py`).
+2. **Measure** — ping DNS + YouTube/Facebook/Telegram, plus a 1MB download sample.
+3. **Log** — everything goes into `{cfg.CSV_FILE}` with an auto label like `wifi_novpn_evening`.
+4. **Learn** — after you have contrasting conditions, the Learn page runs the stats / classifier.
 
-Not looking at payloads. Not trying to get around anything. Also can't show
-that an ISP *meant* to slow something down, only that some destinations
-look different from 1.1.1.1 / 8.8.8.8 under some conditions.
+**Live logging** (recommended):
 
-What I actually care about:
+```
+.venv/bin/python collect_metrics.py --auto --watch
+```
 
-1. Under a given condition, is youtube/facebook/telegram slower than the dns boxes?
-2. Does that gap go away (or get a lot smaller) when I turn a vpn on?
+Or use the buttons on the Live page.
 
-A gap that's specific to a service *and* disappears on vpn is the usual
-circumstantial thing people point at. Still not proof. Vpn also changes
-the path and dns. I'm treating it as something that needs more runs.
+VPN detection looks for connected macOS VPN services / `utun` interfaces / common VPN apps.
+Hotspot is guessed from the Wi‑Fi name (iPhone, Android, …). If it guesses wrong, run with
+manual flags: `--connection hotspot --vpn novpn --tod evening`.
 
-I read OONI's throttling work (Kazakhstan 2023, Russia 2022, Türkiye 2023)
-before writing this. They compare potentially targeted services against a
-baseline using TLS/download timing. This is a much smaller version of that
-idea, using ping because I can leave it running for half an hour.
-
-A handful of 25-minute sessions from one apartment is a pilot. Don't overread
-a p-value from 200 pings on a Tuesday.
-
-Pinging youtube.com is not watching youtube. Download-shaped throttling
-(speed drops after a few MB, or tethering gets a different bucket) often
-won't show up in RTT. That's why the 1MB sample is there; it's still a weak
-stand-in. Also youtube.com is not googlevideo.com.
-
-Several targets × several labels. I didn't Bonferroni anything. If one
-p-value is 0.04 that is not a finding by itself.
-
-GRU only makes sense if something changes *during* a session. If the csv
-is independent rounds, a classifier on the aggregates is enough.
+Vantage is set in `config.py` as **{cfg.VANTAGE_CITY}**. Timing only — no payloads, no bypass.
         """
     )

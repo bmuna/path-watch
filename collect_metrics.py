@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-    python collect_metrics.py --connection wifi --vpn novpn --tod evening
+    python collect_metrics.py --auto --watch
 
 Ping every target each round (tcp connect if icmp is blocked). Every few
 rounds, pull 1MB and record Mbps. Timing only, no payloads.
 
-~20-30 min per condition. interval is a floor; 5 hosts already take a bit.
+--auto detects wifi/hotspot + vpn + time-of-day from this machine.
+--watch keeps logging until you hit ctrl-c.
 """
 
 from __future__ import annotations
@@ -227,39 +228,99 @@ def empty_metric():
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--connection", required=True, choices=cfg.CONNECTION_CHOICES)
-    p.add_argument("--vpn", required=True, choices=cfg.VPN_CHOICES)
-    p.add_argument("--tod", required=True, choices=cfg.TOD_CHOICES)
-    p.add_argument("--minutes", type=float, default=25, help="how long to run (default 25)")
+    p.add_argument("--auto", action="store_true", help="detect wifi/hotspot + vpn + time-of-day each round")
+    p.add_argument("--connection", choices=cfg.CONNECTION_CHOICES)
+    p.add_argument("--vpn", choices=cfg.VPN_CHOICES)
+    p.add_argument("--tod", choices=cfg.TOD_CHOICES)
+    p.add_argument("--minutes", type=float, default=25, help="how long to run (default 25; ignored with --watch)")
+    p.add_argument("--watch", action="store_true", help="keep going until ctrl-c (good with --auto)")
     p.add_argument("--interval", type=float, default=12, help="seconds between rounds (default 12)")
     p.add_argument("--csv", default=cfg.CSV_FILE)
     p.add_argument("--note", default="", help="free-text, e.g. 'other people on netflix'")
     p.add_argument("--once", action="store_true", help="one round then exit (sanity check)")
     p.add_argument("--no-throughput", action="store_true")
-    return p.parse_args()
+    args = p.parse_args()
+    if not args.auto:
+        missing = [k for k in ("connection", "vpn", "tod") if getattr(args, k) is None]
+        if missing:
+            p.error("need --connection/--vpn/--tod, or pass --auto")
+    return args
+
+
+def resolve_condition(args):
+    """Manual labels, or sniff the machine."""
+    if not args.auto:
+        label = f"{args.connection}_{args.vpn}_{args.tod}"
+        return {
+            "connection": args.connection,
+            "vpn": args.vpn,
+            "tod": args.tod,
+            "label": label,
+            "note": args.note,
+            "meta": None,
+        }
+    from network_status import snapshot
+
+    snap = snapshot()
+    note = args.note
+    bits = []
+    if snap.get("ssid"):
+        bits.append(f"ssid={snap['ssid']}")
+    if snap.get("public_ip"):
+        bits.append(f"ip={snap['public_ip']}")
+    if snap.get("vpn_reason"):
+        bits.append(snap["vpn_reason"])
+    auto_note = "; ".join(bits)
+    if note:
+        note = f"{note} | {auto_note}"
+    else:
+        note = auto_note
+    return {
+        "connection": snap["connection"],
+        "vpn": snap["vpn"],
+        "tod": snap["tod"],
+        "label": snap["label"],
+        "note": note,
+        "meta": snap,
+    }
 
 
 def main():
     args = parse_args()
-    label = f"{args.connection}_{args.vpn}_{args.tod}"
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:6]
     ensure_csv(args.csv)
 
-    duration = 0 if args.once else args.minutes * 60
+    duration = 0 if (args.once or args.watch) else args.minutes * 60
     t_start = time.time()
     round_idx = 0
+    last_label = None
 
     print(f"run_id={run_id}")
-    print(f"label={label}  csv={args.csv}")
+    print(f"csv={args.csv}")
     print(f"targets: {', '.join(h for h, _ in all_targets())}")
+    if args.auto:
+        print("mode=auto (re-detect connection/vpn/tod each round)")
     if args.once:
         print("single round")
+    elif args.watch:
+        print(f"watching forever, interval ~{args.interval}s (ctrl-c to stop)")
     else:
         print(f"running for {args.minutes} min, interval ~{args.interval}s")
-    print("ctrl-c to stop early (rows already written are kept)\n")
+    print()
 
     try:
         while True:
+            cond = resolve_condition(args)
+            if cond["label"] != last_label:
+                print(f"label={cond['label']}")
+                if cond.get("meta"):
+                    m = cond["meta"]
+                    print(
+                        f"  detected: {m.get('connection_reason')} | vpn={m.get('vpn')} "
+                        f"({m.get('vpn_reason')}) | ip={m.get('public_ip')}"
+                    )
+                last_label = cond["label"]
+
             round_idx += 1
             elapsed = time.time() - t_start
             ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -274,11 +335,11 @@ def main():
                         "run_id": run_id,
                         "round_idx": round_idx,
                         "elapsed_s": round(elapsed, 1),
-                        "label": label,
-                        "connection": args.connection,
-                        "vpn": args.vpn,
-                        "tod": args.tod,
-                        "note": args.note,
+                        "label": cond["label"],
+                        "connection": cond["connection"],
+                        "vpn": cond["vpn"],
+                        "tod": cond["tod"],
+                        "note": cond["note"],
                         "target": host,
                         "role": role,
                         "throughput_mbps": "",
@@ -299,11 +360,11 @@ def main():
                         "run_id": run_id,
                         "round_idx": round_idx,
                         "elapsed_s": round(elapsed, 1),
-                        "label": label,
-                        "connection": args.connection,
-                        "vpn": args.vpn,
-                        "tod": args.tod,
-                        "note": args.note,
+                        "label": cond["label"],
+                        "connection": cond["connection"],
+                        "vpn": cond["vpn"],
+                        "tod": cond["tod"],
+                        "note": cond["note"],
                         "target": "cloudflare_1mb",
                         "role": "throughput",
                         "method": "http_get",
@@ -320,7 +381,7 @@ def main():
 
             if args.once:
                 break
-            if time.time() - t_start >= duration:
+            if not args.watch and duration and time.time() - t_start >= duration:
                 break
 
             spent = time.time() - t_start - elapsed

@@ -4,4 +4,7 @@ scipy
 scikit-learn
 streamlit
 plotly
-
+psutil
+customtkinter
+matplotlib
+pillow

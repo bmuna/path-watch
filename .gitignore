@@ -1,4 +1,6 @@
 metrics_log.csv
+traffic_log.csv
+speed_log.csv
 __pycache__/
 *.pyc
 .venv/
@@ -8,3 +10,5 @@ venv/
 *.pt
 mw_results.csv
 clf_report.txt
+.live_collector.pid
+.live_collector.log

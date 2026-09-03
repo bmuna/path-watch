@@ -3,51 +3,42 @@
 Wifi at home is usually fine. When I tether the laptop off my phone it gets
 weird, especially at night, and I keep thinking it depends on what I'm using
 (youtube vs just browsing). Maybe that's real, maybe I'm just annoyed. This
-is me logging latency / jitter / loss so I can check instead of guessing.
+is me logging what my Mac actually does on the network so I can check instead
+of guessing.
 
-Timing only. I'm not looking at payloads and I'm not trying to get around
-anything. If the numbers are boring that's also an answer.
+**Main thing:** a desktop app that watches connections *your apps already make*
+(browser, Telegram, downloads…). It does **not** visit YouTube/Facebook itself.
+It records who you connected to, live upload/download speed, wifi vs hotspot,
+VPN on/off, and time of day. Metadata only — no payloads, no bypass.
 
-Each run is tagged `wifi|hotspot` + `vpn|novpn` + time of day, e.g.
-`hotspot_novpn_evening`.
-
-## collecting
-
-Python 3.11+ (I'm on 3.12). Don't need root.
+## desktop app (start here)
 
 ```
 python3.12 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+python desktop_app.py
 ```
 
-~25 min on one condition:
+Or double-click `Path Watch.command` after the venv exists.
+
+Leave it open and use the internet normally. Turn VPN on/off, switch to
+hotspot, download something — that contrast is what the hints learn from.
+
+Logs land in `traffic_log.csv` (each new connection) and `speed_log.csv`
+(upload/download every couple seconds).
+
+## optional: active ping collector
+
+The older `collect_metrics.py` still exists if you want deliberate pings to
+DNS / sites. Prefer the desktop watcher for day-to-day data.
 
 ```
-python collect_metrics.py --connection wifi --vpn novpn --tod evening
+python collect_metrics.py --auto --watch
 ```
 
-One round to see if ping even works:
-
-```
-python collect_metrics.py --connection wifi --vpn novpn --tod morning --once
-```
-
-`--note "someone else on netflix"` is optional, just stored in the csv.
-
-Every ~12s it pings 1.1.1.1 / 8.8.8.8 (baseline) and youtube / facebook /
-telegram. If icmp is blocked it falls back to a tcp connect on 443 (53 for
-8.8.8.8). That happened on a guest network once. Method is in the csv so
-I don't mix them later.
-
-Every 8th round it also pulls ~1MB from cloudflare and records Mbps. Ping
-will not catch "icmp is fine but downloads get a low bucket", which is kind
-of the thing I think is happening on hotspot.
-
-I want at least 8 runs before I look at this, and they have to actually
-differ (wifi and hotspot, vpn and not, morning and evening). One long
-hotspot capture is useless. Don't start a hotspot run and then wander onto
-wifi.
+`network_status.py` detects SSID / VPN / clock / public IP
+(`python network_status.py` to print what it thinks).
 
 ## analysis
 
