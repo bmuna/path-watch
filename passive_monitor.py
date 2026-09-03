@@ -2,12 +2,9 @@
 """
 Passive traffic monitor — no subprocesses on the hot path.
 
-Speed:       psutil.net_io_counters   (~0.06 ms)
-Connections: psutil.net_connections   (fast; lsof only as fallback)
-App usage:   nettop -s0 on a slow 10s timer, never blocking the main sample
-
-All blocking I/O runs in a ThreadPoolExecutor; the UI gets results via
-a simple queue.
+Hot path (~0.06 ms): psutil.net_io_counters only.
+Every connection is geo-enriched (lat/lon/ISP/country) via ip-api.com batch
+running off-thread. Geo data is stored in traffic_log.csv.
 """
 
 from __future__ import annotations
@@ -27,20 +24,26 @@ from typing import Callable
 import psutil
 
 import config as cfg
+from geo_cache import geo, is_private
 from network_status import snapshot as net_snapshot
 
 TRAFFIC_CSV = getattr(cfg, "TRAFFIC_CSV", "traffic_log.csv")
 SPEED_CSV   = getattr(cfg, "SPEED_CSV",   "speed_log.csv")
 
-TRAFFIC_FIELDS = ["ts","event","remote_ip","remote_port","local_port","status",
-                  "pid","process","hostname","connection","vpn","tod","label",
-                  "public_ip","ssid"]
-SPEED_FIELDS   = ["ts","down_mbps","up_mbps","bytes_recv","bytes_sent",
-                  "connection","vpn","tod","label","public_ip","iface"]
+TRAFFIC_FIELDS = [
+    "ts", "event", "remote_ip", "remote_port", "local_port", "status",
+    "pid", "process", "hostname",
+    "connection", "vpn", "tod", "label", "public_ip", "ssid",
+    # geo fields — filled in as geo resolves
+    "geo_lat", "geo_lon", "geo_country", "geo_country_code",
+    "geo_city", "geo_region", "geo_isp", "geo_org", "geo_asn",
+]
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+SPEED_FIELDS = [
+    "ts", "down_mbps", "up_mbps", "bytes_recv", "bytes_sent",
+    "connection", "vpn", "tod", "label", "public_ip", "iface",
+]
+
 
 def _ensure_csv(path: str, fields: list[str]):
     if os.path.exists(path) and os.path.getsize(path) > 0:
@@ -64,7 +67,6 @@ def fmt_bytes(n: int) -> str:
     if n >= 1_000:         return f"{n/1e3:.1f} KB"
     return f"{n} B"
 
-
 def pretty_name(raw: str) -> str:
     for s in (" Helper (Renderer)", " Helper (GPU)", " Helper"):
         if raw.endswith(s):
@@ -73,10 +75,6 @@ def pretty_name(raw: str) -> str:
         raw = raw.split("(")[0].strip()
     return raw.strip() or "unknown"
 
-
-# ---------------------------------------------------------------------------
-# DNS cache (background threads, never blocks the sample)
-# ---------------------------------------------------------------------------
 
 class HostCache:
     def __init__(self, maxsize: int = 1024):
@@ -92,13 +90,10 @@ class HostCache:
         return ""
 
     def prefetch(self, ip: str):
-        if not ip or self.get(ip) != "":
-            return
-        # mark as "in progress" so we don't submit twice
         with self._lock:
             if ip in self._c:
                 return
-            self._c[ip] = ""          # placeholder
+            self._c[ip] = ""
         self._pool.submit(self._resolve, ip)
 
     def _resolve(self, ip: str):
@@ -113,14 +108,9 @@ class HostCache:
                 self._c.popitem(last=False)
 
 
-# ---------------------------------------------------------------------------
-# Fast interface counter (pure psutil, ~0.06 ms)
-# ---------------------------------------------------------------------------
-
 def _best_iface() -> tuple[str, int, int]:
     per = psutil.net_io_counters(pernic=True)
-    best, best_total = None, -1
-    best_name = "all"
+    best, best_total, best_name = None, -1, "all"
     skip = ("lo", "awdl", "llw", "utun", "bridge", "ap", "lo0")
     for name, c in per.items():
         if any(name.startswith(s) for s in skip):
@@ -134,19 +124,14 @@ def _best_iface() -> tuple[str, int, int]:
     return best_name, best.bytes_recv, best.bytes_sent
 
 
-# ---------------------------------------------------------------------------
-# Fast connection list (psutil first, lsof only if Access Denied)
-# ---------------------------------------------------------------------------
-
 def _connections_fast() -> list[dict]:
-    """Returns list of dicts with remote_ip, remote_port, process, pid, status."""
     try:
         rows = []
         for c in psutil.net_connections(kind="inet"):
             if not c.raddr:
                 continue
             ip = c.raddr.ip
-            if ip in ("127.0.0.1", "::1") or ip.startswith(("127.", "169.254.", "fe80:")):
+            if is_private(ip):
                 continue
             try:
                 proc = psutil.Process(c.pid).name() if c.pid else ""
@@ -163,8 +148,6 @@ def _connections_fast() -> list[dict]:
         return rows
     except (psutil.AccessDenied, PermissionError):
         pass
-
-    # macOS fallback — lsof but only when psutil fails (rare)
     if platform.system() != "Darwin":
         return []
     try:
@@ -179,15 +162,15 @@ def _connections_fast() -> list[dict]:
         parts = line.split()
         if len(parts) < 9:
             continue
-        name_field = next((x for x in parts if "->" in x), "")
-        if not name_field:
+        name_f = next((x for x in parts if "->" in x), "")
+        if not name_f:
             continue
-        left, right = name_field.split("->", 1)
+        left, right = name_f.split("->", 1)
         if ":" not in right:
             continue
         rip, rport_s = right.rsplit(":", 1)
         rip = rip.strip("[]")
-        if rip in ("127.0.0.1", "::1") or rip.startswith("127."):
+        if is_private(rip):
             continue
         try:
             rport = int(rport_s)
@@ -206,12 +189,7 @@ def _connections_fast() -> list[dict]:
     return rows
 
 
-# ---------------------------------------------------------------------------
-# App-level byte accounting via nettop (slow; run every 10 s off-thread)
-# ---------------------------------------------------------------------------
-
 def _nettop_bytes() -> dict[str, tuple[int, int]]:
-    """Return {app_name: (bytes_in, bytes_out)} cumulative."""
     if platform.system() != "Darwin":
         return {}
     try:
@@ -229,8 +207,7 @@ def _nettop_bytes() -> dict[str, tuple[int, int]]:
         parts = line.split(",")
         if len(parts) < 3 or "." not in parts[0]:
             continue
-        raw_name = parts[0].rsplit(".", 1)[0]
-        name = pretty_name(raw_name)
+        name = pretty_name(parts[0].rsplit(".", 1)[0])
         try:
             bi, bo = int(parts[1] or 0), int(parts[2] or 0)
         except ValueError:
@@ -239,10 +216,6 @@ def _nettop_bytes() -> dict[str, tuple[int, int]]:
         out[name] = (max(prev[0], bi), max(prev[1], bo))
     return out
 
-
-# ---------------------------------------------------------------------------
-# Session delta tracker
-# ---------------------------------------------------------------------------
 
 class SessionUsage:
     def __init__(self):
@@ -266,30 +239,27 @@ class SessionUsage:
         return max(0, bi - bbi), max(0, bo - bbo)
 
 
-# ---------------------------------------------------------------------------
-# Main monitor
-# ---------------------------------------------------------------------------
-
 class TrafficMonitor:
     def __init__(self, interval: float = 2.0, on_tick: Callable | None = None):
-        self.interval  = interval
-        self.on_tick   = on_tick
-        self.hosts     = HostCache()
-        self.session   = SessionUsage()
+        self.interval = interval
+        self.on_tick  = on_tick
+        self.hosts    = HostCache()
+        self.session  = SessionUsage()
 
-        self._stop     = threading.Event()
+        self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._nettop_lock  = threading.Lock()
         self._nettop_cache: dict[str, tuple[int, int]] = {}
         self._nettop_time  = 0.0
-
-        self._last_recv = 0
-        self._last_sent = 0
-        self._last_t    = 0.0
+        self._last_recv    = 0
+        self._last_sent    = 0
+        self._last_t       = 0.0
         self._seen: set[tuple] = set()
 
-        self.latest: dict = {"down_mbps": 0.0, "up_mbps": 0.0,
-                             "active_count": 0, "apps": [], "net": {}}
+        self.latest: dict = {
+            "down_mbps": 0.0, "up_mbps": 0.0,
+            "active_count": 0, "apps": [], "net": {},
+        }
 
     def start(self):
         if self._thread and self._thread.is_alive():
@@ -310,7 +280,6 @@ class TrafficMonitor:
         return bool(self._thread and self._thread.is_alive())
 
     def _refresh_nettop(self):
-        """Called off-thread every 10s — updates the nettop cache."""
         nb = _nettop_bytes()
         with self._nettop_lock:
             self._nettop_cache = nb
@@ -318,38 +287,26 @@ class TrafficMonitor:
         self.session.update_nettop(nb)
 
     def _loop(self):
-        # kick off initial nettop refresh in background
         threading.Thread(target=self._refresh_nettop, daemon=True, name="nettop-init").start()
-        nettop_interval = 10.0
-
         while not self._stop.is_set():
             t0 = time.perf_counter()
             try:
                 self._sample()
             except Exception as e:
                 self.latest["error"] = str(e)
+            if time.time() - self._nettop_time > 10.0:
+                self._nettop_time = time.time()
+                threading.Thread(target=self._refresh_nettop, daemon=True).start()
             elapsed = time.perf_counter() - t0
-
-            # refresh nettop off-thread every 10s
-            if time.time() - self._nettop_time > nettop_interval:
-                self._nettop_time = time.time()  # prevent double-launch
-                threading.Thread(target=self._refresh_nettop, daemon=True, name="nettop").start()
-
-            wait = max(0.0, self.interval - elapsed)
-            self._stop.wait(wait)
+            self._stop.wait(max(0.0, self.interval - elapsed))
 
     def _sample(self):
-        # --- network snapshot (fast; just reads env) ---
         net = net_snapshot()
-
-        # --- speed (pure psutil, ~0.06 ms) ---
         now = time.time()
         iface, recv, sent = _best_iface()
         dt   = max(now - self._last_t, 1e-6)
-        down = max(0.0, (recv - self._last_recv) * 8 / dt / 1e6)
-        up   = max(0.0, (sent - self._last_sent) * 8 / dt / 1e6)
-        if down > 5000: down = 0.0
-        if up   > 5000: up   = 0.0
+        down = max(0.0, min((recv - self._last_recv) * 8 / dt / 1e6, 5000.0))
+        up   = max(0.0, min((sent - self._last_sent) * 8 / dt / 1e6, 5000.0))
         self._last_recv, self._last_sent, self._last_t = recv, sent, now
 
         ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -361,24 +318,24 @@ class TrafficMonitor:
             "public_ip": net.get("public_ip") or "", "iface": iface,
         }])
 
-        # --- connections (fast psutil path) ---
-        conns  = _connections_fast()
+        conns = _connections_fast()
         new_rows = []
         current_keys: set[tuple] = set()
-
         conn_by_app: dict[str, int] = {}
         hosts_by_app: dict[str, list[str]] = {}
 
         for c in conns:
-            rip   = c["remote_ip"]
-            key   = (rip, c["remote_port"], c["local_port"], c["status"], c["pid"])
+            rip  = c["remote_ip"]
+            key  = (rip, c["remote_port"], c["local_port"], c["status"], c["pid"])
             current_keys.add(key)
 
+            # enqueue geo lookup (non-blocking)
+            geo.enqueue(rip)
             self.hosts.prefetch(rip)
+
             host = self.hosts.get(rip) or ""
             proc = c.get("process") or "unknown"
-
-            conn_by_app[proc]  = conn_by_app.get(proc, 0) + 1
+            conn_by_app[proc] = conn_by_app.get(proc, 0) + 1
             if host:
                 lst = hosts_by_app.setdefault(proc, [])
                 if host not in lst:
@@ -386,6 +343,7 @@ class TrafficMonitor:
 
             if key not in self._seen and c["status"] in ("ESTABLISHED", "SYN_SENT"):
                 self._seen.add(key)
+                g = geo.get(rip) or {}
                 new_rows.append({
                     "ts": ts, "event": "connect",
                     "remote_ip": rip, "remote_port": c["remote_port"],
@@ -395,6 +353,15 @@ class TrafficMonitor:
                     "tod": net["tod"], "label": net["label"],
                     "public_ip": net.get("public_ip") or "",
                     "ssid": net.get("ssid") or "",
+                    "geo_lat":          g.get("lat", ""),
+                    "geo_lon":          g.get("lon", ""),
+                    "geo_country":      g.get("country", ""),
+                    "geo_country_code": g.get("country_code", ""),
+                    "geo_city":         g.get("city", ""),
+                    "geo_region":       g.get("region", ""),
+                    "geo_isp":          g.get("isp", ""),
+                    "geo_org":          g.get("org", ""),
+                    "geo_asn":          g.get("asn", ""),
                 })
 
         self._seen &= current_keys
@@ -403,40 +370,49 @@ class TrafficMonitor:
 
         _append_csv(TRAFFIC_CSV, TRAFFIC_FIELDS, new_rows)
 
-        # --- build app list from nettop cache + conn counts ---
         with self._nettop_lock:
             nb = dict(self._nettop_cache)
 
         apps = []
-        all_names = set(conn_by_app) | set(nb)
-        for name in all_names:
+        for name in set(conn_by_app) | set(nb):
             din, dout = self.session.delta(name)
             total = din + dout
             conns_n = conn_by_app.get(name, 0)
-            if total < 1024 and conns_n == 0:
+            if total < 512 and conns_n == 0:
                 continue
             apps.append({
-                "name":        name,
-                "bytes_in":    din,
-                "bytes_out":   dout,
+                "name": name,
+                "bytes_in": din, "bytes_out": dout,
                 "total_bytes": total,
-                "total_fmt":   fmt_bytes(total),
-                "conns":       conns_n,
-                "top_hosts":   hosts_by_app.get(name, [])[:4],
+                "total_fmt": fmt_bytes(total),
+                "conns": conns_n,
+                "top_hosts": hosts_by_app.get(name, [])[:4],
             })
         apps.sort(key=lambda a: a["total_bytes"], reverse=True)
 
         total_session = sum(a["total_bytes"] for a in apps)
+
+        # throttle score for this moment
+        from throttle_engine import score_current
+        ts_score = score_current(down, up, net.get("label", ""))
+
         self.latest = {
-            "down_mbps":         round(down, 2),
-            "up_mbps":           round(up,   2),
-            "active_count":      len(conns),
-            "apps":              apps[:25],
+            "down_mbps":          round(down, 2),
+            "up_mbps":            round(up, 2),
+            "active_count":       len(conns),
+            "apps":               apps[:25],
             "session_total_bytes": total_session,
-            "session_total_fmt": fmt_bytes(total_session),
-            "net":               net,
-            "iface":             iface,
-            "ts":                ts,
+            "session_total_fmt":  fmt_bytes(total_session),
+            "net":                net,
+            "iface":              iface,
+            "ts":                 ts,
+            "throttle_score":     ts_score,
+            # live geo feed for map: all currently known IPs
+            "live_geo":           [
+                {"ip": c["remote_ip"], **geo.get(c["remote_ip"])}
+                for c in conns
+                if geo.get(c["remote_ip"])
+            ],
         }
         if self.on_tick:
             try:
@@ -455,9 +431,10 @@ def main():
     mon = TrafficMonitor(interval=args.interval)
     def show(s):
         n = s["net"]
-        print(f"\r↓{s['down_mbps']:5.2f} ↑{s['up_mbps']:5.2f} Mbps  "
-              f"conns={s['active_count']:3d}  {n.get('label')}  "
-              f"apps={len(s['apps'])}   ", end="", flush=True)
+        sc = s.get("throttle_score", {})
+        print(f"\r↓{s['down_mbps']:5.2f} ↑{s['up_mbps']:5.2f} Mbps "
+              f"conns={s['active_count']:3d} score={sc.get('score',0):3d} "
+              f"{n.get('label')}   ", end="", flush=True)
     mon.on_tick = show
     mon.start()
     try:
