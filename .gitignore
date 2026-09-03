@@ -1,0 +1,10 @@
+metrics_log.csv
+__pycache__/
+*.pyc
+.venv/
+venv/
+.DS_Store
+*.pkl
+*.pt
+mw_results.csv
+clf_report.txt
