@@ -2,11 +2,9 @@
 """
 Path Watch — desktop app.
 
-Wide, readable. Smooth: monitor runs in background thread, UI only updates
-labels in-place (no widget rebuilds). Speed chart is a lightweight canvas
-sparkline — no matplotlib overhead.
-
-    .venv/bin/python desktop_app.py
+Hot path: psutil only (~0.06 ms). Subprocesses run off-thread every 10 s.
+UI updates in-place — no widget creation on each tick.
+Sparkline is a native tk.Canvas (no matplotlib).
 """
 
 from __future__ import annotations
@@ -34,240 +32,249 @@ ROW    = "#252b33"
 LINE   = "#3d4654"
 TEXT   = "#f0f4f8"
 MUTED  = "#9eafc0"
-ACCENT = "#4dabf7"   # blue — download
-WARN   = "#fcc419"   # amber — upload
+ACCENT = "#4dabf7"
+WARN   = "#fcc419"
 GREEN  = "#51cf66"
+RED    = "#ff6b6b"
 
 
-# ---------------------------------------------------------------------------
-# Lightweight canvas sparkline (no matplotlib)
-# ---------------------------------------------------------------------------
+# ── sparkline ────────────────────────────────────────────────────────────────
 
 class Sparkline(tk.Canvas):
-    """Draw two line series directly on a tk.Canvas. Fast — no Matplotlib."""
-
-    def __init__(self, master, bg: str = ROW, **kw):
-        super().__init__(master, bg=bg, highlightthickness=0, **kw)
-        self._d: deque[float] = deque(maxlen=80)
-        self._u: deque[float] = deque(maxlen=80)
-        self._legend_drawn = False
+    def __init__(self, master, **kw):
+        super().__init__(master, bg=ROW, highlightthickness=0, **kw)
+        self._d: deque[float] = deque(maxlen=90)
+        self._u: deque[float] = deque(maxlen=90)
 
     def push(self, down: float, up: float):
         self._d.append(down)
         self._u.append(up)
-        self._redraw()
+        self.after_idle(self._draw)
 
-    def _redraw(self):
-        self.delete("data")
+    def _draw(self):
+        self.delete("all")
         W = self.winfo_width()
         H = self.winfo_height()
-        if W < 10 or H < 10:
+        if W < 20 or H < 20:
             return
-        pad = 28
-        w = W - pad
-        h = H - 24
+        PAD_L, PAD_B = 38, 18
 
         peak = max(max(self._d, default=0), max(self._u, default=0), 0.5)
+        draw_w = W - PAD_L - 4
+        draw_h = H - PAD_B - 6
 
         def pts(series):
-            n = len(series)
+            data = list(series)
+            n = len(data)
             if n < 2:
                 return []
-            step = w / max(n - 1, 1)
-            out = []
-            for i, v in enumerate(series):
-                x = pad + i * step
-                y = h - (v / peak) * (h - 4)
-                out += [x, y]
-            return out
+            step = draw_w / max(n - 1, 1)
+            return [
+                coord
+                for i, v in enumerate(data)
+                for coord in (PAD_L + i * step, (H - PAD_B) - v / peak * draw_h)
+            ]
 
-        for series, color in [(self._d, ACCENT), (self._u, WARN)]:
+        # grid lines
+        for frac in (0.25, 0.5, 0.75, 1.0):
+            y = (H - PAD_B) - frac * draw_h
+            self.create_line(PAD_L, y, W - 4, y, fill="#2e3740", width=1)
+            self.create_text(PAD_L - 4, y, anchor="e",
+                             text=f"{peak*frac:.1f}", fill=MUTED, font=("Helvetica", 9))
+
+        for series, color in ((self._d, ACCENT), (self._u, WARN)):
             p = pts(series)
             if len(p) >= 4:
-                self.create_line(p, fill=color, width=2, smooth=True, tags="data")
+                self.create_line(p, fill=color, width=2, smooth=True)
 
-        # y-axis labels
-        self.delete("axis")
-        self.create_text(2, 4,  anchor="nw", text=f"{peak:.1f}", fill=MUTED, font=("Helvetica", 9), tags="axis")
-        self.create_text(2, h//2, anchor="w",  text=f"{peak/2:.1f}", fill=MUTED, font=("Helvetica", 9), tags="axis")
-        self.create_text(2, h-4, anchor="sw", text="0", fill=MUTED, font=("Helvetica", 9), tags="axis")
+        # x-axis
+        self.create_line(PAD_L, H - PAD_B, W - 4, H - PAD_B, fill=LINE, width=1)
+        self.create_text(PAD_L,     H - 4, anchor="w", text="90 s ago", fill=MUTED, font=("Helvetica", 9))
+        self.create_text(W - 4,     H - 4, anchor="e", text="now",       fill=MUTED, font=("Helvetica", 9))
 
-        if not self._legend_drawn:
-            self.create_text(W - 80, H - 14, anchor="w", text="▬ down", fill=ACCENT, font=("Helvetica", 9))
-            self.create_text(W - 30, H - 14, anchor="w", text="▬ up", fill=WARN, font=("Helvetica", 9))
-            self._legend_drawn = True
-
-
-# ---------------------------------------------------------------------------
-# App row — created once, updated in-place
-# ---------------------------------------------------------------------------
-
-class AppRow(ctk.CTkFrame):
-    def __init__(self, master, name: str):
-        super().__init__(master, fg_color=ROW, corner_radius=8)
-        self.pack(fill="x", pady=3)
-
-        top = ctk.CTkFrame(self, fg_color="transparent")
-        top.pack(fill="x", padx=12, pady=(8, 2))
-
-        self._name_lbl = ctk.CTkLabel(
-            top, text=name, text_color=TEXT,
-            font=ctk.CTkFont(size=14, weight="bold"), anchor="w"
-        )
-        self._name_lbl.pack(side="left", fill="x", expand=True)
-
-        self._size_lbl = ctk.CTkLabel(
-            top, text="0 B", text_color=TEXT,
-            font=ctk.CTkFont(size=14, weight="bold")
-        )
-        self._size_lbl.pack(side="right")
-
-        self._sub_lbl = ctk.CTkLabel(
-            self, text="", text_color=MUTED,
-            font=ctk.CTkFont(size=11), anchor="w"
-        )
-        self._sub_lbl.pack(fill="x", padx=12)
-
-        self._bar_bg = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=3, height=6)
-        self._bar_bg.pack(fill="x", padx=12, pady=(4, 10))
-        self._bar_bg.pack_propagate(False)
-        self._bar = ctk.CTkFrame(self._bar_bg, fg_color=ACCENT, corner_radius=3, width=0, height=6)
-        self._bar.pack(side="left")
-
-    def update(self, size_fmt: str, frac: float, sub: str, bar_w: int):
-        self._size_lbl.configure(text=size_fmt)
-        self._sub_lbl.configure(text=sub)
-        self._bar.configure(width=max(bar_w, 0))
+        # legend
+        self.create_text(W - 90, 8, anchor="w", text="▬ down", fill=ACCENT, font=("Helvetica", 9))
+        self.create_text(W - 45, 8, anchor="w", text="▬ up",   fill=WARN,   font=("Helvetica", 9))
+        self.create_text(8, 8, anchor="nw",
+                         text=f"Mbps", fill=MUTED, font=("Helvetica", 9))
 
 
-# ---------------------------------------------------------------------------
-# Main window
-# ---------------------------------------------------------------------------
+# ── app row (created once, updated in-place) ─────────────────────────────────
+
+class AppRow:
+    """A fixed-height frame representing one app. Never re-created."""
+
+    HEIGHT = 52
+
+    def __init__(self, parent):
+        self.frame = tk.Frame(parent, bg=ROW, height=self.HEIGHT)
+        self.frame.pack(fill="x", pady=2)
+        self.frame.pack_propagate(False)
+
+        # icon placeholder
+        self._icon = tk.Label(self.frame, text="●", fg=ACCENT, bg=ROW,
+                              font=("Helvetica", 13))
+        self._icon.place(x=10, y=14)
+
+        self._name = tk.Label(self.frame, text="", fg=TEXT, bg=ROW,
+                              font=("Helvetica", 14, "bold"), anchor="w")
+        self._name.place(x=36, y=8, width=220)
+
+        self._size = tk.Label(self.frame, text="", fg=TEXT, bg=ROW,
+                              font=("Helvetica", 13, "bold"), anchor="e")
+        self._size.place(relx=1.0, x=-14, y=8, anchor="ne", width=120)
+
+        self._sub = tk.Label(self.frame, text="", fg=MUTED, bg=ROW,
+                             font=("Helvetica", 10), anchor="w")
+        self._sub.place(x=36, y=30, width=340)
+
+        # bar bg
+        self._bar_bg = tk.Frame(self.frame, bg=PANEL, height=4)
+        self._bar_bg.place(x=36, rely=1.0, y=-8, relwidth=1.0, width=-50, height=4)
+        self._bar = tk.Frame(self._bar_bg, bg=ACCENT, height=4)
+        self._bar.place(x=0, y=0, height=4, width=0)
+
+    def update(self, name: str, size_fmt: str, sub: str, frac: float):
+        self._name.configure(text=name)
+        self._size.configure(text=size_fmt)
+        self._sub.configure(text=sub)
+        # bar width: update after geometry is resolved
+        self.frame.update_idletasks()
+        bar_w = max(int(frac * self._bar_bg.winfo_width()), 0)
+        self._bar.place(width=bar_w)
+
+    def show(self): self.frame.pack(fill="x", pady=2)
+    def hide(self): self.frame.pack_forget()
+
+
+# ── KPI card ─────────────────────────────────────────────────────────────────
+
+class KpiCard:
+    def __init__(self, parent, title: str):
+        f = tk.Frame(parent, bg=PANEL, bd=0)
+        f.pack(side="left", fill="x", expand=True, padx=3)
+        tk.Label(f, text=title.upper(), fg=MUTED, bg=PANEL,
+                 font=("Helvetica", 10, "bold")).pack(anchor="w", padx=10, pady=(8, 0))
+        self._val = tk.Label(f, text="—", fg=TEXT, bg=PANEL,
+                             font=("Helvetica", 18, "bold"))
+        self._val.pack(anchor="w", padx=10, pady=(0, 10))
+
+    def set(self, text: str, color: str = TEXT):
+        self._val.configure(text=text, fg=color)
+
+
+# ── main window ──────────────────────────────────────────────────────────────
 
 class PathWatchApp(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title("Path Watch")
-        self.geometry("1100x740")
-        self.minsize(900, 620)
+        self.geometry("1120x760")
+        self.minsize(900, 640)
         self.configure(fg_color=BG)
 
-        self.monitor = TrafficMonitor(interval=3.0, on_tick=self._on_tick)
+        self.monitor = TrafficMonitor(interval=2.0, on_tick=self._on_tick)
         self._queue: deque = deque(maxlen=4)
         self._lock  = threading.Lock()
-        # rows keyed by app name — created once, updated in-place
-        self._rows: dict[str, AppRow] = {}
-        self._row_order: list[str] = []
+        self._rows: dict[str, AppRow] = {}    # name → row; never re-created
 
         self._build()
         self.protocol("WM_DELETE_WINDOW", self._close)
         self.after(100, self._drain)
-        self.after(1500, self._refresh_hints)
+        self.after(2000, self._refresh_hints)
         self.monitor.start()
 
-    # ------------------------------------------------------------------
-    # Layout
-    # ------------------------------------------------------------------
+    # ── layout ───────────────────────────────────────────────────────────────
 
     def _build(self):
         # header
-        head = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=0, height=52)
-        head.pack(fill="x")
-        head.pack_propagate(False)
-        ctk.CTkLabel(
-            head, text="Path Watch",
-            font=ctk.CTkFont(size=21, weight="bold"), text_color=TEXT
-        ).pack(side="left", padx=18, pady=12)
-        ctk.CTkLabel(
-            head, text="Watches your apps · no website probing",
-            font=ctk.CTkFont(size=13), text_color=MUTED
-        ).pack(side="left", padx=4)
-        self._clock = ctk.CTkLabel(head, text="", font=ctk.CTkFont(size=13), text_color=MUTED)
+        hdr = tk.Frame(self, bg=PANEL, height=52)
+        hdr.pack(fill="x")
+        hdr.pack_propagate(False)
+        tk.Label(hdr, text="Path Watch", fg=TEXT, bg=PANEL,
+                 font=("Helvetica", 20, "bold")).pack(side="left", padx=18, pady=12)
+        tk.Label(hdr, text="Watches your apps · no website probing",
+                 fg=MUTED, bg=PANEL, font=("Helvetica", 12)).pack(side="left", padx=4)
+        self._clock = tk.Label(hdr, text="", fg=MUTED, bg=PANEL, font=("Helvetica", 12))
         self._clock.pack(side="right", padx=18)
 
-        body = ctk.CTkFrame(self, fg_color=BG)
-        body.pack(fill="both", expand=True, padx=14, pady=12)
+        body = tk.Frame(self, bg=BG)
+        body.pack(fill="both", expand=True, padx=14, pady=10)
 
         # KPI row
-        kpi_row = ctk.CTkFrame(body, fg_color="transparent")
-        kpi_row.pack(fill="x", pady=(0, 10))
-        self._kpi: dict[str, ctk.CTkLabel] = {}
-        for key, title in [
-            ("down",  "Download"),
-            ("up",    "Upload"),
-            ("vpn",   "VPN"),
-            ("link",  "Connection"),
-            ("tod",   "Time"),
-            ("ip",    "Public IP"),
-            ("total", "Session data"),
-        ]:
-            c = ctk.CTkFrame(kpi_row, fg_color=PANEL, corner_radius=10,
-                             border_width=1, border_color=LINE)
-            c.pack(side="left", fill="x", expand=True, padx=3)
-            ctk.CTkLabel(c, text=title.upper(), text_color=MUTED,
-                         font=ctk.CTkFont(size=11, weight="bold")).pack(anchor="w", padx=12, pady=(8, 0))
-            v = ctk.CTkLabel(c, text="—", text_color=TEXT,
-                             font=ctk.CTkFont(size=18, weight="bold"))
-            v.pack(anchor="w", padx=12, pady=(0, 10))
-            self._kpi[key] = v
+        kpi_row = tk.Frame(body, bg=BG)
+        kpi_row.pack(fill="x", pady=(0, 8))
+        self._kpi: dict[str, KpiCard] = {}
+        for key, title in [("down","Download"),("up","Upload"),("vpn","VPN"),
+                            ("link","Connection"),("tod","Time"),
+                            ("ip","Public IP"),("total","Session data")]:
+            self._kpi[key] = KpiCard(kpi_row, title)
 
-        # mid row: sparkline + hints
-        mid = ctk.CTkFrame(body, fg_color="transparent")
+        # mid: sparkline + hints
+        mid = tk.Frame(body, bg=BG)
         mid.pack(fill="both", expand=True)
 
-        left = ctk.CTkFrame(mid, fg_color=PANEL, corner_radius=12,
-                            border_width=1, border_color=LINE)
-        left.pack(side="left", fill="both", expand=True, padx=(0, 8))
-        ctk.CTkLabel(left, text="Live speed",
-                     text_color=TEXT, font=ctk.CTkFont(size=15, weight="bold")
-                     ).pack(anchor="w", padx=14, pady=(12, 4))
-        self._spark = Sparkline(left, bg=ROW, height=130)
-        self._spark.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        # sparkline panel
+        lp = tk.Frame(mid, bg=PANEL, bd=0)
+        lp.pack(side="left", fill="both", expand=True, padx=(0, 8))
+        tk.Label(lp, text="Live speed", fg=TEXT, bg=PANEL,
+                 font=("Helvetica", 14, "bold")).pack(anchor="w", padx=12, pady=(10, 4))
+        self._spark = Sparkline(lp, height=130)
+        self._spark.pack(fill="both", expand=True, padx=8, pady=(0, 10))
 
-        right = ctk.CTkFrame(mid, fg_color=PANEL, corner_radius=12,
-                             border_width=1, border_color=LINE, width=380)
-        right.pack(side="right", fill="both")
-        right.pack_propagate(False)
-        ctk.CTkLabel(right, text="Throttling check",
-                     text_color=TEXT, font=ctk.CTkFont(size=15, weight="bold")
-                     ).pack(anchor="w", padx=14, pady=(12, 4))
-        ctk.CTkLabel(right,
-                     text="Compares speed across VPN on/off · wifi vs hotspot · time of day.",
-                     text_color=MUTED, font=ctk.CTkFont(size=12),
-                     wraplength=350, justify="left"
-                     ).pack(anchor="w", padx=14, pady=(0, 6))
-        self._hints = ctk.CTkTextbox(right, fg_color=ROW, text_color=TEXT,
-                                     font=ctk.CTkFont(family="Menlo", size=12), wrap="word")
+        # hints panel
+        rp = tk.Frame(mid, bg=PANEL, bd=0, width=390)
+        rp.pack(side="right", fill="both")
+        rp.pack_propagate(False)
+        tk.Label(rp, text="Throttling check", fg=TEXT, bg=PANEL,
+                 font=("Helvetica", 14, "bold")).pack(anchor="w", padx=12, pady=(10, 2))
+        tk.Label(rp,
+                 text="Compares speed across VPN on/off · wifi vs hotspot · time of day.",
+                 fg=MUTED, bg=PANEL, font=("Helvetica", 11),
+                 wraplength=360, justify="left").pack(anchor="w", padx=12, pady=(0, 4))
+        self._hints = tk.Text(rp, bg=ROW, fg=TEXT, font=("Menlo", 11),
+                              relief="flat", wrap="word", state="disabled",
+                              padx=10, pady=8, cursor="arrow")
         self._hints.pack(fill="both", expand=True, padx=10, pady=(0, 6))
-        self._hints.insert("1.0", "Loading…")
-        self._hints.configure(state="disabled")
-        btn_row = ctk.CTkFrame(right, fg_color="transparent")
-        btn_row.pack(fill="x", padx=10, pady=(0, 10))
-        ctk.CTkButton(btn_row, text="Refresh", width=90, height=28,
-                      fg_color=LINE, command=self._refresh_hints).pack(side="left")
-        ctk.CTkButton(btn_row, text="Reset", width=80, height=28,
-                      fg_color=LINE, command=self._reset).pack(side="left", padx=6)
-        ctk.CTkButton(btn_row, text="Open logs", width=90, height=28,
-                      fg_color=LINE, command=self._open_logs).pack(side="right")
+
+        btn_r = tk.Frame(rp, bg=PANEL)
+        btn_r.pack(fill="x", padx=10, pady=(0, 10))
+        for lbl, cmd in [("Refresh", self._refresh_hints),
+                         ("Reset",   self._reset),
+                         ("Open logs", self._open_logs)]:
+            tk.Button(btn_r, text=lbl, command=cmd,
+                      bg=LINE, fg=TEXT, relief="flat",
+                      font=("Helvetica", 12), padx=10, pady=4,
+                      activebackground="#4a5568", activeforeground=TEXT,
+                      cursor="hand2").pack(side="left", padx=(0, 6))
 
         # app list
-        bottom = ctk.CTkFrame(body, fg_color=PANEL, corner_radius=12,
-                              border_width=1, border_color=LINE)
-        bottom.pack(fill="both", expand=True, pady=(10, 0))
-        bh = ctk.CTkFrame(bottom, fg_color="transparent")
-        bh.pack(fill="x", padx=14, pady=(10, 4))
-        ctk.CTkLabel(bh, text="Apps using your network",
-                     text_color=TEXT, font=ctk.CTkFont(size=15, weight="bold")
-                     ).pack(side="left")
-        self._conn_count = ctk.CTkLabel(bh, text="", text_color=MUTED,
-                                        font=ctk.CTkFont(size=12))
-        self._conn_count.pack(side="left", padx=12)
-        self._list = ctk.CTkScrollableFrame(bottom, fg_color="transparent", height=180)
-        self._list.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        ap = tk.Frame(body, bg=PANEL, bd=0)
+        ap.pack(fill="both", expand=True, pady=(8, 0))
+        ah = tk.Frame(ap, bg=PANEL)
+        ah.pack(fill="x", padx=12, pady=(8, 4))
+        tk.Label(ah, text="Apps using your network", fg=TEXT, bg=PANEL,
+                 font=("Helvetica", 14, "bold")).pack(side="left")
+        self._conn_lbl = tk.Label(ah, text="", fg=MUTED, bg=PANEL,
+                                  font=("Helvetica", 11))
+        self._conn_lbl.pack(side="left", padx=10)
 
-    # ------------------------------------------------------------------
-    # Threading
-    # ------------------------------------------------------------------
+        canvas = tk.Canvas(ap, bg=PANEL, highlightthickness=0)
+        vsb = tk.Scrollbar(ap, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True, padx=(10, 0), pady=(0, 10))
+        self._list = tk.Frame(canvas, bg=PANEL)
+        self._list_id = canvas.create_window((0, 0), window=self._list, anchor="nw")
+        self._list.bind("<Configure>", lambda e: canvas.configure(
+            scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfig(
+            self._list_id, width=e.width))
+        canvas.bind_all("<MouseWheel>", lambda e: canvas.yview_scroll(
+            int(-e.delta / 60), "units"))
+        self._scroll_canvas = canvas
+
+    # ── threading ────────────────────────────────────────────────────────────
 
     def _on_tick(self, state: dict):
         with self._lock:
@@ -277,95 +284,66 @@ class PathWatchApp(ctk.CTk):
         state = None
         with self._lock:
             if self._queue:
-                state = self._queue[-1]   # only latest
+                state = self._queue[-1]
                 self._queue.clear()
         if state:
             self._apply(state)
-        self.after(200, self._drain)
+        self.after(180, self._drain)
 
-    # ------------------------------------------------------------------
-    # UI update — in-place only, no widget creation on the hot path
-    # ------------------------------------------------------------------
+    # ── in-place update ───────────────────────────────────────────────────────
 
     def _apply(self, state: dict):
         net = state.get("net") or {}
+        self._clock.configure(text=datetime.now().strftime("%H:%M:%S"))
 
-        # clock
-        self._clock.configure(text=f"Updated {datetime.now().strftime('%H:%M:%S')}")
-
-        # KPIs
-        down = state.get("down_mbps", 0)
-        up   = state.get("up_mbps",   0)
-        self._kpi["down"].configure(text=f"{down:.2f} Mbps")
-        self._kpi["up"].configure(text=f"{up:.2f} Mbps")
+        self._kpi["down"].set(f"{state.get('down_mbps', 0):.2f} Mbps")
+        self._kpi["up"].set(f"{state.get('up_mbps', 0):.2f} Mbps")
         vpn_on = net.get("vpn") == "vpn"
-        self._kpi["vpn"].configure(text="ON" if vpn_on else "OFF",
-                                   text_color=GREEN if vpn_on else TEXT)
-        self._kpi["link"].configure(text=str(net.get("connection", "—")).upper())
-        self._kpi["tod"].configure(text=str(net.get("tod", "—")))
-        self._kpi["ip"].configure(text=str(net.get("public_ip") or "—"),
-                                  font=ctk.CTkFont(size=14, weight="bold"))
-        self._kpi["total"].configure(text=state.get("session_total_fmt") or "0 B")
+        self._kpi["vpn"].set("ON" if vpn_on else "OFF",
+                             GREEN if vpn_on else TEXT)
+        self._kpi["link"].set(str(net.get("connection", "—")).upper())
+        self._kpi["tod"].set(str(net.get("tod", "—")))
+        self._kpi["ip"].set(str(net.get("public_ip") or "—"))
+        self._kpi["total"].set(state.get("session_total_fmt") or "0 B")
 
-        # sparkline — one call, all math is inside the canvas
-        self._spark.push(down, up)
+        self._spark.push(state.get("down_mbps", 0), state.get("up_mbps", 0))
 
-        # app rows — create missing ones, update existing ones in-place
         apps = state.get("apps") or []
-        n_conns = state.get("active_count", 0)
-        self._conn_count.configure(
-            text=f"{n_conns} open socket{'s' if n_conns != 1 else ''}"
-                 f" across {len(apps)} app{'s' if len(apps) != 1 else ''}"
+        n_sockets = state.get("active_count", 0)
+        self._conn_lbl.configure(
+            text=f"{n_sockets} sockets · {len(apps)} apps"
         )
 
-        if not apps:
-            for w in self._rows.values():
-                w.pack_forget()
-            return
-
         max_b = max((a.get("total_bytes") or 0 for a in apps), default=1) or 1
-        bar_max = self._list.winfo_width() - 30
+        seen: set[str] = set()
 
-        seen = set()
         for app in apps:
             name = app.get("name") or "?"
             seen.add(name)
-            frac = (app.get("total_bytes") or 0) / max_b
-            bar_w = max(int(frac * bar_max), 0)
             conns = int(app.get("conns") or 0)
             hosts = app.get("top_hosts") or []
-            sub = f"{conns} connection{'s' if conns != 1 else ''}"
+            sub = f"{conns} socket{'s' if conns != 1 else ''}"
             if hosts:
                 sub += f" · {hosts[0]}"
+            frac = (app.get("total_bytes") or 0) / max_b
 
             if name not in self._rows:
-                row = AppRow(self._list, name)
-                self._rows[name] = row
-                self._row_order.append(name)
+                self._rows[name] = AppRow(self._list)
+            self._rows[name].show()
+            self._rows[name].update(name, app.get("total_fmt") or "0 B", sub, frac)
 
-            self._rows[name].update(
-                size_fmt=app.get("total_fmt") or "0 B",
-                frac=frac,
-                sub=sub,
-                bar_w=bar_w,
-            )
-            self._rows[name].pack(fill="x", pady=3)
-
-        # hide rows for apps no longer active
         for name, row in self._rows.items():
             if name not in seen:
-                row.pack_forget()
+                row.hide()
 
-    # ------------------------------------------------------------------
-    # Hints (background thread, slow OK)
-    # ------------------------------------------------------------------
+    # ── hints (off-thread) ───────────────────────────────────────────────────
 
     def _refresh_hints(self):
         def work():
             try:
                 text = throttling_report(ROOT / cfg.TRAFFIC_CSV, ROOT / cfg.SPEED_CSV)
             except Exception as e:
-                text = f"Analysis error: {e}"
+                text = f"Error: {e}"
             self.after(0, self._set_hints, text)
 
         threading.Thread(target=work, daemon=True, name="hints").start()
@@ -377,14 +355,11 @@ class PathWatchApp(ctk.CTk):
         self._hints.insert("1.0", text)
         self._hints.configure(state="disabled")
 
-    # ------------------------------------------------------------------
-    # Misc
-    # ------------------------------------------------------------------
+    # ── misc ─────────────────────────────────────────────────────────────────
 
     def _reset(self):
         self.monitor.session.reset()
-        self._kpi["total"].configure(text="0 B")
-        self._refresh_hints()
+        self._kpi["total"].set("0 B")
 
     def _open_logs(self):
         os.system(f'open "{ROOT}"')
