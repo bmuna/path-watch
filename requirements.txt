@@ -6,5 +6,4 @@ streamlit
 plotly
 psutil
 customtkinter
-matplotlib
 pillow
