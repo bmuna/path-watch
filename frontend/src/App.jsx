@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
-import { MapContainer, TileLayer, CircleMarker, Popup } from 'react-leaflet'
+import { MapContainer, TileLayer, CircleMarker, Popup, useMap } from 'react-leaflet'
 import 'leaflet/dist/leaflet.css'
 import {
   AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer,
@@ -144,8 +144,43 @@ function AppList({ apps }) {
   )
 }
 
+// Vantage: Addis Ababa
+const VANTAGE = [9.0245, 38.7485]
+
+// ── HeatLayer: draws the speed heatmap overlay ─────────────────────────────
+function HeatLayer({ points }) {
+  const map = useMap()
+  const layerRef = useRef(null)
+
+  useEffect(() => {
+    if (!points?.length) return
+    let cancelled = false
+    import('leaflet.heat').then(() => {
+      if (cancelled) return
+      if (layerRef.current) map.removeLayer(layerRef.current)
+      // leaflet.heat attaches to window.L automatically
+      const L = window.L
+      if (!L?.heatLayer) return
+      const heat = L.heatLayer(points, {
+        radius: 28,
+        blur: 22,
+        maxZoom: 9,
+        gradient: { 0.0: '#2196f3', 0.5: '#ffc107', 1.0: '#f44336' },
+      })
+      heat.addTo(map)
+      layerRef.current = heat
+    }).catch(() => {})
+    return () => {
+      cancelled = true
+      if (layerRef.current) { map.removeLayer(layerRef.current); layerRef.current = null }
+    }
+  }, [points, map])
+
+  return null
+}
+
 // ─── Map ─────────────────────────────────────────────────────────────────────
-function GeoMap({ points }) {
+function GeoMap({ points, heatPoints }) {
   const grouped = Object.values(
     (points || []).reduce((acc, g) => {
       if (!g?.lat || !g?.lon) return acc
@@ -157,12 +192,37 @@ function GeoMap({ points }) {
   )
 
   return (
-    <MapContainer center={[20, 10]} zoom={2} className="map-canvas" attributionControl={false} zoomControl={false}>
-      <TileLayer url="https://{s}.basemaps.cartocdn.com/dark_nolabels/{z}/{x}/{y}{r}.png" />
+    // Center on Addis Ababa, zoom 4 so Ethiopia + nearby countries are visible
+    <MapContainer center={VANTAGE} zoom={4} className="map-canvas" attributionControl={true}>
+      {/* OpenStreetMap — no API key required */}
+      <TileLayer
+        url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+        attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
+      />
+
+      {/* Speed heatmap overlay */}
+      {heatPoints?.length > 0 && <HeatLayer points={heatPoints} />}
+
+      {/* Your machine — vantage point */}
+      <CircleMarker
+        center={VANTAGE}
+        radius={8}
+        pathOptions={{ color: '#f85149', fillColor: '#f85149', fillOpacity: 1, weight: 2 }}
+      >
+        <Popup>
+          <div className="map-popup">
+            <strong>Your machine</strong>
+            <div>Addis Ababa, Ethiopia</div>
+            <div className="map-popup-sub">SAFARICOM / STEP ISP</div>
+          </div>
+        </Popup>
+      </CircleMarker>
+
+      {/* Remote IPs your apps connect to */}
       {grouped.map((p, i) => (
         <CircleMarker key={i} center={[p.lat, p.lon]}
-          radius={Math.min(3 + p.count * 1.2, 16)}
-          pathOptions={{ color: '#4a9ef7', fillColor: '#4a9ef7', fillOpacity: 0.65, weight: 0 }}
+          radius={Math.min(3 + p.count * 1.5, 18)}
+          pathOptions={{ color: '#4a9ef7', fillColor: '#4a9ef7', fillOpacity: 0.7, weight: 0 }}
         >
           <Popup>
             <div className="map-popup">
@@ -317,11 +377,21 @@ export default function App() {
 
         {/* ── map ── */}
         {tab === 'map' && <>
+          <div className="map-legend-row">
+            <span><i className="leg-dot" style={{ background: '#f85149', borderRadius: '50%', display: 'inline-block', width: 8, height: 8, marginRight: 5 }} />Your machine (Addis Ababa)</span>
+            <span><i className="leg-dot" style={{ background: '#4a9ef7', borderRadius: '50%', display: 'inline-block', width: 8, height: 8, marginRight: 5 }} />Remote server</span>
+            <span style={{ color: 'var(--text-3)' }}>Heat = speed (blue fast → red slow)</span>
+          </div>
           <div className="card" style={{ padding: 0, overflow: 'hidden' }}>
             <div className="card-head-bar">
-              <Section title="Live connections" right={`${live?.live_geo?.length ?? 0} geo-located of ${live?.active_count ?? 0} sockets`} />
+              <Section title="Live connections" right={`${live?.live_geo?.length ?? 0} geo-located · ${live?.active_count ?? 0} total sockets`} />
             </div>
-            <GeoMap points={live?.live_geo} />
+            <GeoMap
+              points={live?.live_geo}
+              heatPoints={(data?.map_points || [])
+                .filter(p => p.lat && p.lon)
+                .map(p => [p.lat, p.lon, Math.min(p.connections / 20, 1)])}
+            />
           </div>
           {data?.isp_analysis?.length > 0 && (
             <div className="card" style={{ marginTop: 12 }}>

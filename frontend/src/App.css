@@ -257,9 +257,14 @@ body {
 }
 
 /* ── map ── */
-.map-canvas { height: 420px; width: 100%; }
+.map-canvas { height: 440px; width: 100%; }
 .map-popup { font-size: 12px; color: #111; line-height: 1.5; }
 .map-popup-sub { color: #555; font-size: 11px; }
+.map-legend-row {
+  display: flex; gap: 20px; align-items: center;
+  font-size: 12px; color: var(--text-2);
+  margin-bottom: 10px;
+}
 
 /* ── vpn bars ── */
 .vpn-row {
