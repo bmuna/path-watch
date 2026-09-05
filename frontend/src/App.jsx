@@ -92,7 +92,7 @@ function AlertRow({ a }) {
 }
 
 // ─── Heatmap ─────────────────────────────────────────────────────────────────
-function Heatmap({ data }) {
+function Heatmap({ data, invert, unit }) {
   if (!data?.length) return <p className="empty">Needs data across multiple hours and days.</p>
   const dayMap = { Monday:'Mon', Tuesday:'Tue', Wednesday:'Wed', Thursday:'Thu', Friday:'Fri', Saturday:'Sat', Sunday:'Sun' }
   const ORDER  = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun']
@@ -101,6 +101,7 @@ function Heatmap({ data }) {
   const lookup = {}
   data.forEach(d => { lookup[`${d.hour}-${dayMap[d.day] || d.day}`] = d.value })
   const maxV   = Math.max(...data.map(d => d.value), 0.01)
+  const suffix = unit || 'Mbps'
 
   return (
     <div className="hm-wrap">
@@ -114,13 +115,13 @@ function Heatmap({ data }) {
           {days.map(d => {
             const v   = lookup[`${h}-${d}`]
             const frac = v != null ? v / maxV : 0
-            const slow = v != null && frac < 0.45
+            const hot  = v != null && (invert ? frac > 0.55 : frac < 0.45)
             const bg   = v != null
-              ? `rgba(${slow ? '255,107,107' : '74,158,247'},${0.08 + frac * 0.72})`
+              ? `rgba(${hot ? '255,107,107' : '74,158,247'},${0.08 + frac * 0.72})`
               : 'rgba(255,255,255,0.02)'
             return (
-              <div key={d} className="hm-cell hm-data" style={{ background: bg }} title={v != null ? `${v.toFixed(2)} Mbps` : ''}>
-                {v != null ? v.toFixed(1) : ''}
+              <div key={d} className="hm-cell hm-data" style={{ background: bg }} title={v != null ? `${v.toFixed(2)} ${suffix}` : ''}>
+                {v != null ? (invert ? v.toFixed(2) : v.toFixed(1)) : ''}
               </div>
             )
           })}
@@ -323,7 +324,7 @@ function buildHeatPoints(mode, live, data, score) {
   }
 
   // world: every destination this machine reached
-  for (const p of data?.dest_heat || []) push(p.lat, p.lon, p.intensity)
+  for (const p of data?.dest_heat || []) push(p.lat, p.lon, p.p_throttled ?? p.intensity)
   for (const g of live?.live_geo || []) push(g.lat, g.lon, Math.min(0.7, 0.2 + (g.n || 1) / 20))
   for (const p of data?.map_points || []) push(p.lat, p.lon, Math.min(0.65, 0.15 + (p.connections || 1) / 30))
   return pts
@@ -364,6 +365,7 @@ function GeoMap({ live, data, score }) {
         out.push({
           ip: p.remote_ip, lat: ll[0], lon: ll[1],
           city: p.city, country: p.country, isp: p.isp, n: p.connections || 1,
+          p_throttled: p.p_throttled,
         })
       }
     }
@@ -382,9 +384,12 @@ function GeoMap({ live, data, score }) {
   const sc = scoreColor(score)
   const sw = scoreWord(score)
   const destCount = data?.path_meta?.destinations ?? data?.map_points?.length ?? remotes.length
-  const pathNote = data?.path_meta?.tod_slow
-    ? `Slower at ${data.path_meta.tod_slow.tod}`
-    : 'All sockets feed this heat'
+  const pNow = data?.model?.p_now ?? live?.p_throttled
+  const pathNote = data?.model?.trained
+    ? `Learned model · P=${pNow != null ? Number(pNow).toFixed(2) : '—'} · expected ${data?.model?.expected_now ?? live?.expected_mbps ?? '—'} Mbps`
+    : data?.path_meta?.tod_slow
+      ? `Slower at ${data.path_meta.tod_slow.tod}`
+      : 'Training on your logs…'
 
   return (
     <div className="map-wrap">
@@ -434,7 +439,7 @@ function GeoMap({ live, data, score }) {
               <strong>Your machine</strong>
               <div>{live?.vantage_city || 'Addis Ababa'}</div>
               <div className="map-popup-sub">{linkLabel(live)} · {live?.tod || ''}</div>
-              <div className="map-popup-sub">{destCount} destinations in the model</div>
+              <div className="map-popup-sub">{destCount} destinations scored by the model</div>
             </div>
           </Popup>
         </CircleMarker>
@@ -451,6 +456,7 @@ function GeoMap({ live, data, score }) {
                 <strong>{p.city || p.country || p.ip}</strong>
                 {p.isp && <div>{p.isp}</div>}
                 <div className="map-popup-sub">{p.ip} · {p.n || 1} socket{(p.n || 1) !== 1 ? 's' : ''}</div>
+                {p.p_throttled != null && <div className="map-popup-sub">P(throttle) {Number(p.p_throttled).toFixed(2)}</div>}
               </div>
             </Popup>
           </CircleMarker>
@@ -596,7 +602,13 @@ export default function App() {
                   </span>
                 </div>
                 {live?.throttle_reason && <p className="score-reason">{live.throttle_reason}</p>}
-                {live?.baseline_down != null && (
+                {live?.expected_mbps != null && (
+                  <p className="text-3" style={{ marginTop: 4 }}>
+                    Expected {live.expected_mbps} Mbps
+                    {live.p_throttled != null ? ` · P(throttle) ${Number(live.p_throttled).toFixed(2)}` : ''}
+                  </p>
+                )}
+                {live?.baseline_down != null && live?.expected_mbps == null && (
                   <p className="text-3" style={{ marginTop: 4 }}>Baseline {live.baseline_down} Mbps</p>
                 )}
               </div>
@@ -618,7 +630,7 @@ export default function App() {
             <span><i className="leg-dot" style={{ background: '#f85149', borderRadius: '50%', display: 'inline-block', width: 8, height: 8, marginRight: 5 }} />Your machine</span>
             <span className="heat-scale">
               <span className="heat-scale-bar" />
-              Addis path heat — all sockets (green ok → purple throttled)
+              Model heat — time · link · VPN · destination (green ok → purple throttled)
             </span>
           </div>
           <div className="card" style={{ padding: 0, overflow: 'hidden' }}>
@@ -650,6 +662,34 @@ export default function App() {
           <div className="cols">
             <div className="col col-wide">
               <div className="card">
+                <Section title="Model" right={data?.model?.trained ? `CV AUC ${data.model.cv_auc} · R² ${data.model.r2}` : 'not trained'} />
+                {data?.model?.trained ? (
+                  <div className="cond-grid">
+                    <div className="cond-item">
+                      <span className="text-3">Labeled rows</span>
+                      <span className="cond-val">{data.model.n_labeled}</span>
+                      <span className="text-3">{data.model.n_pos} throttle / {data.model.n_neg} clear</span>
+                    </div>
+                    <div className="cond-item">
+                      <span className="text-3">Now</span>
+                      <span className="cond-val">{data.model.p_now != null ? Number(data.model.p_now).toFixed(2) : '—'}</span>
+                      <span className="text-3">expected {data.model.expected_now ?? '—'} Mbps</span>
+                    </div>
+                    {Object.entries(data.model.importances || {}).slice(0, 6).map(([k, v]) => (
+                      <div className="cond-item" key={k}>
+                        <code className="cond-code">{k}</code>
+                        <span className="cond-val">{Number(v).toFixed(3)}</span>
+                        <span className="text-3">importance</span>
+                      </div>
+                    ))}
+                  </div>
+                ) : <p className="empty">Train with python train_model.py — uses speed_log.csv</p>}
+              </div>
+              <div className="card" style={{ marginTop: 12 }}>
+                <Section title="Model P(throttle) — hour × day" />
+                <Heatmap data={data?.model_heatmap} invert unit="P" />
+              </div>
+              <div className="card" style={{ marginTop: 12 }}>
                 <Section title="Speed — hour × day" />
                 <Heatmap data={data?.heatmap} />
               </div>

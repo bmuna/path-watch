@@ -1,6 +1,8 @@
 pandas>=2.0
 numpy
 scipy
+scikit-learn
+joblib
 psutil
 fastapi
 uvicorn[standard]

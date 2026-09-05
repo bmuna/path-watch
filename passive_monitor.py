@@ -432,7 +432,7 @@ class TrafficMonitor:
 
         # throttle score for this moment
         from throttle_engine import score_current
-        ts_score = score_current(down, up, net.get("label", ""))
+        ts_score = score_current(down, up, net.get("label", ""), _live_geo(conns))
 
         self.latest = {
             "down_mbps":          round(down, 2),

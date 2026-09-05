@@ -21,6 +21,7 @@ import pandas as pd
 from scipy import stats
 
 import config as cfg
+from model import map_layers, model_hour_heatmap, score_live
 
 SPEED_CSV   = Path(getattr(cfg, "SPEED_CSV",   "speed_log.csv"))
 TRAFFIC_CSV = Path(getattr(cfg, "TRAFFIC_CSV", "traffic_log.csv"))
@@ -432,16 +433,14 @@ def _attach_geo(result: dict, speed: pd.DataFrame, traffic: pd.DataFrame) -> Non
 
 # ─────────────────────────────────────────────────────────────────────────────
 
-def score_current(current_down: float, current_up: float, label: str) -> dict:
-    """
-    Score the current moment vs the historical baseline for this label.
-    Returns a 0-100 throttle score plus a text reason.
-    """
+def score_current(current_down: float, current_up: float, label: str, dests: list | None = None) -> dict:
+    out = score_live(current_down, current_up, label, dests)
+    if out.get("source") == "model":
+        return out
     df = _read_speed()
     if df.empty or len(df) < 10:
         return {"score": 0, "reason": "Not enough history yet", "baseline_down": None}
 
-    # baseline: all rows with the same connection+tod (ignoring vpn for baseline)
     parts = label.split("_") if label else []
     conn = parts[0] if len(parts) > 0 else ""
     tod  = parts[2] if len(parts) > 2 else ""
@@ -457,34 +456,26 @@ def score_current(current_down: float, current_up: float, label: str) -> dict:
         base = df["down_mbps"].dropna()
 
     med = float(base.median())
-    p10 = float(base.quantile(0.10))
-    p90 = float(base.quantile(0.90))
-
     if med < 0.001:
         return {"score": 0, "reason": "Baseline too small to score", "baseline_down": med}
 
     ratio = current_down / med if med > 0 else 1.0
     if ratio >= 0.8:
-        score = 0
-        reason = f"Normal — {current_down:.2f} Mbps vs baseline {med:.2f} Mbps"
+        score, reason = 0, f"Normal — {current_down:.2f} Mbps vs baseline {med:.2f} Mbps"
     elif ratio >= 0.5:
-        score = int((1 - ratio) / 0.3 * 40)
-        reason = f"Slightly slow — {current_down:.2f} Mbps vs baseline {med:.2f} Mbps"
+        score, reason = int((1 - ratio) / 0.3 * 40), f"Slightly slow — {current_down:.2f} Mbps vs baseline {med:.2f} Mbps"
     elif ratio >= 0.2:
-        score = 40 + int((0.5 - ratio) / 0.3 * 40)
-        reason = f"Noticeably slow — {current_down:.2f} Mbps vs baseline {med:.2f} Mbps"
+        score, reason = 40 + int((0.5 - ratio) / 0.3 * 40), f"Noticeably slow — {current_down:.2f} Mbps vs baseline {med:.2f} Mbps"
     else:
-        score = min(100, 80 + int((0.2 - ratio) / 0.2 * 20))
-        reason = f"Very slow — {current_down:.2f} Mbps vs baseline {med:.2f} Mbps"
+        score, reason = min(100, 80 + int((0.2 - ratio) / 0.2 * 20)), f"Very slow — {current_down:.2f} Mbps vs baseline {med:.2f} Mbps"
 
     return {
         "score": score,
         "reason": reason,
         "baseline_down": round(med, 3),
-        "baseline_p10": round(p10, 3),
-        "baseline_p90": round(p90, 3),
         "current_down": round(current_down, 3),
         "ratio": round(ratio, 3),
+        "source": "heuristic",
     }
 
 
@@ -510,9 +501,26 @@ def analyze_all() -> dict:
         "dest_heat": [],
         "throttle_areas": [],
         "path_meta": {},
+        "model": {},
+        "model_heatmap": [],
     }
 
     _attach_geo(result, df, traffic)
+    last = df.iloc[-1].to_dict() if not df.empty else {}
+    layers = map_layers(df, traffic, {
+        "connection": last.get("connection"),
+        "vpn": last.get("vpn"),
+        "tod": last.get("tod"),
+        "down_mbps": last.get("down_mbps"),
+        "up_mbps": last.get("up_mbps"),
+    })
+    result.update({k: layers[k] for k in (
+        "city_heat", "geo_heat", "dest_heat", "throttle_areas",
+        "map_points", "path_meta", "model",
+    ) if k in layers})
+    mh = model_hour_heatmap(df)
+    if mh:
+        result["model_heatmap"] = mh
 
     if df.empty:
         result["alerts"].append({"level": "info", "title": "No data yet",

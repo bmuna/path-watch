@@ -11,22 +11,27 @@ Timing gaps are **not** proof of ISP intent.
 
 ## Architecture (current)
 
-Passive FastAPI backend + React frontend. No Streamlit, no active ping collector,
-no trained GRU / classifier.
+Passive FastAPI backend + React frontend. A gradient-boosting model trains on
+`speed_log.csv` (time, wifi/hotspot, VPN, destinations) and drives the live
+score plus the map heat. No Streamlit, no site probing.
 
 | Piece | Role |
 |-------|------|
 | `server.py` | FastAPI + WebSocket `/ws/live` + `/api/analysis` |
 | `passive_monitor.py` | Speeds + sockets via psutil → CSV logs |
 | `geo_cache.py` | IP → lat/lng (ip-api.com batch) |
-| `throttle_engine.py` | Heuristic / statistical scorer + descriptive analysis |
+| `model.py` / `train_model.py` | HistGradientBoosting on the logs → score + map heat |
+| `throttle_engine.py` | Stats + wires the trained model into `/api/analysis` |
 | `network_status.py` | wifi/hotspot, VPN, TOD, public IP |
 | `frontend/` | React UI (monitor / map / analysis / apps) |
 
-`throttle_engine.py` compares live speed to same-condition baselines and
-summarizes logs (TOD, VPN, connection). It is **not** a trained ML model.
-Next step (not built): train a sequence model once enough labeled session
-data exists.
+`model.py` trains two heads on the logs: expected Mbps, and P(throttled)
+from VPN / time-of-day / link contrast labels. The map paints that
+probability — Addis for the local path, world for destinations.
+
+```
+python train_model.py
+```
 
 Logs (gitignored): `speed_log.csv`, `traffic_log.csv`.  
 Legacy `metrics_log.csv` may exist from an older ping pilot; it is not what
@@ -49,8 +54,7 @@ VPN on/off and wifi ↔ hotspot while it logs.
 
 ## Findings so far (passive `speed_log.csv`, one evening in Addis)
 
-Heuristic / statistical summary only — not a trained model. Timing is not
-proof of ISP intent.
+Model + stats on the same logs. Timing is not proof of ISP intent.
 
 **VPN-on vs off (wifi, evening — same TOD bucket)**
 
@@ -89,8 +93,8 @@ Evening hotspot is slower than evening wifi on median. Night hotspot recovered
 somewhat (different hour, still cellular).
 
 **Still thin:** afternoon n=213; no VPN-on afternoon; one home, one evening.
-Overnight/morning wifi samples would strengthen TOD. Next step (not built):
-train a sequence model once enough labeled session data exists.
+Overnight samples would still help TOD. Retrain after long new sessions:
+`python train_model.py`.
 
 ## Config
 

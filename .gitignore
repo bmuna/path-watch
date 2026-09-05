@@ -8,6 +8,7 @@ venv/
 .DS_Store
 *.pkl
 *.pt
+!models/pathwatch.joblib
 mw_results.csv
 clf_report.txt
 .live_collector.pid
