@@ -30,8 +30,12 @@ from VPN / time-of-day / link contrast labels. The map paints that
 probability — Addis for the local path, world for destinations.
 
 ```
+source .venv/bin/activate
 python train_model.py
+python -m unittest tests.test_model -v
 ```
+
+If `python3` is the system 3.9, use `.venv/bin/python` instead.
 
 Logs (gitignored): `speed_log.csv`, `traffic_log.csv`.  
 Legacy `metrics_log.csv` may exist from an older ping pilot; it is not what
